@@ -1,3 +1,8 @@
-torch
-gensim
-tiktoken
+torch==2.8.0
+gensim==4.4.0
+tiktoken==0.13.0
+datasets==4.5.0
+huggingface_hub==0.36.2
+transformers==4.57.6
+
+
