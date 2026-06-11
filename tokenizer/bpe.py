@@ -1,6 +1,8 @@
 import json
 
 class CustomBPETokenizer:
+    WORD_END = "</w>"
+
     def __init__(self):
         # vocab: list of all tokens (base characters + merged tokens)
         # merges: ordered list of merge rules learned during training
@@ -14,7 +16,8 @@ class CustomBPETokenizer:
     # Before any merging, BPE starts by splitting every word into individual characters.
     def pretokenize(self, text):
         words = text.split()
-        return [list(word) for word in words]
+        # mark the end of each word so boundaries survive encoding
+        return [list(word) + [self.WORD_END] for word in words]
 
     # Counting pairs. We need to scan every word and count how often each adjacent pair appears across the whole corpus.
     def get_pairs(self, words):
@@ -99,7 +102,8 @@ class CustomBPETokenizer:
         # Convert IDs back to tokens and join with spaces
         # note: spaces between words are approximated since pretokenize splits on whitespace
         tokens = [self.itos[i] for i in token_ids]
-        return " ".join(tokens)
+        text = "".join(tokens)
+        return text.replace(self.WORD_END, " ").strip()
 
     # Save vocab and merges to disk so we don't have to retrain every time
     def save(self, path):
@@ -132,7 +136,7 @@ if __name__ == "__main__":
     # Train on corpus and save
     tokenizer = CustomBPETokenizer()
     tokenizer.train(text, num_merges=50)
-    tokenizer.save("../data/bpe_tokenizer.json")
+    #tokenizer.save("../data/bpe_tokenizer.json")
 
     # Test encode and decode on a sample
     sample_text = "Every moment is a beginning"
@@ -144,5 +148,5 @@ if __name__ == "__main__":
     print("Decoded:", decoded)
 
     # To reuse without retraining, load from disk
-    tokenizer = CustomBPETokenizer()
-    tokenizer.load("../data/bpe_tokenizer.json")
+    #tokenizer = CustomBPETokenizer()
+    #tokenizer.load("../data/bpe_tokenizer.json")

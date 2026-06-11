@@ -2,7 +2,8 @@
 
 A from-scratch implementation of LLM components in Python, covering both
 GPT and LLaMA-style architectures. Each component is implemented as a
-standalone, reusable Python module.
+standalone, reusable Python module. Includes both manual implementations
+and PyTorch native equivalents for direct comparison.
 
 ## Structure
 
@@ -16,6 +17,7 @@ standalone, reusable Python module.
 | `residual_connections/` | Residual connection examples |
 | `transformer/` | GPT-style and LLaMA-style transformer blocks |
 | `minigpt/` | MiniGPT and MiniLLaMA — full trainable models |
+| `pytorch_native/` | GPT and LLaMA rebuilt using PyTorch native components |
 | `datasets/` | Custom PyTorch dataset, HuggingFace dataset, HF Hub dataset |
 | `inference/` | Greedy, temperature, top-k, top-p, repetition penalty, beam search |
 | `data/` | tiny_corpus.txt — training corpus |
@@ -56,7 +58,7 @@ deactivate
 ```bash
 python tokenizer/character.py
 python tokenizer/bpe.py
-python tokenizer/tiktoken.py
+python tokenizer/bpe_tiktoken.py
 ```
 
 **Embeddings:**
@@ -84,6 +86,12 @@ python transformer/transformer_llama.py
 ```bash
 python minigpt/gpt.py
 python minigpt/llama.py
+```
+
+**PyTorch Native Models:**
+```bash
+python pytorch_native/gpt.py
+python pytorch_native/llama.py
 ```
 
 **Datasets:**
@@ -127,6 +135,17 @@ A LLaMA-style language model — same training setup, modern architecture choice
 | Normalisation | RMSNorm |
 | FFN | SwiGLU |
 
+### PyTorch Native
+Both models rebuilt using PyTorch native components for direct comparison
+with the manual implementations.
+
+| Component | GPT | LLaMA |
+|-----------|-----|-------|
+| Attention | `nn.TransformerEncoderLayer` | `F.scaled_dot_product_attention` + GQA |
+| Normalisation | `nn.LayerNorm` | `nn.RMSNorm` |
+| FFN | `nn.TransformerEncoderLayer` | SwiGLU |
+| Position | Learned embeddings | RoPE |
+
 ## Inference Techniques
 
 | Technique | Description |
@@ -141,7 +160,7 @@ A LLaMA-style language model — same training setup, modern architecture choice
 ## Requirements
 
 - Python 3.10+
-- PyTorch
+- PyTorch 2.4+ (required for `nn.RMSNorm`)
 - tiktoken
 - datasets (HuggingFace)
 
