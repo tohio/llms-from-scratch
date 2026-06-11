@@ -227,15 +227,15 @@ batch_size    = 32
 max_steps     = 5000
 
 # Build dataset and dataloader
-dataset    = TinyCorpusDataset("../data/tiny_corpus.txt", block_size=block_size)
+dataset = TinyCorpusDataset("../data/tiny_corpus.txt", block_size=block_size)
 
 # 90/10 train/validation split
-split_idx      = int(0.9 * len(dataset))
-train_dataset  = torch.utils.data.Subset(dataset, range(0, split_idx))
-val_dataset    = torch.utils.data.Subset(dataset, range(split_idx, len(dataset)))
+split_idx     = int(0.9 * len(dataset))
+train_dataset = torch.utils.data.Subset(dataset, range(0, split_idx))
+val_dataset   = torch.utils.data.Subset(dataset, range(split_idx, len(dataset)))
 
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
+train_loader  = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+val_loader    = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
 
 print(f"Train sequences:      {len(train_dataset)}")
 print(f"Validation sequences: {len(val_dataset)}")
@@ -245,30 +245,37 @@ print(f"Batches per epoch:    {len(train_loader)}")
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 model.train()
+step = 0
 
-for step, (x, y) in enumerate(train_loader):
-    if step >= max_steps:
-        break
+# outer loop keeps cycling through the dataloader until max_steps is reached
+# without this the model only sees the data once (27 batches) not 5000 steps
+while step < max_steps:
+    for x, y in train_loader:
+        if step >= max_steps:
+            break
 
-    x = x.to(device)
-    y = y.to(device)
+        x = x.to(device)
+        y = y.to(device)
 
-    logits = model(x)
+        logits  = model(x)
+        B, T, C = logits.shape
 
-    # Cross entropy loss — measures how well the model predicts the next token
-    # logits and targets must be 2D and 1D respectively
-    B, T, C = logits.shape
-    loss = F.cross_entropy(
-        logits.view(B * T, C),
-        y.view(B * T)
-    )
+        # Cross entropy loss — measures how well the model predicts the next token
+        # logits and targets must be 2D and 1D respectively
+        loss = F.cross_entropy(
+            logits.view(B * T, C),
+            y.view(B * T)
+        )
 
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-    if step % 200 == 0:
-        print(f"Step {step}, Loss: {loss.item():.4f}")
+        if step % 200 == 0:
+            print(f"Step {step}, Loss: {loss.item():.4f}")
+
+        step += 1
+
 
 
 # ─── Generation ───────────────────────────────────────────────────────────────

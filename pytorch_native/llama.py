@@ -276,30 +276,68 @@ print(f"Batches per epoch:    {len(train_loader)}")
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
 model.train()
+step = 0
 
-for step, (x, y) in enumerate(train_loader):
-    if step >= max_steps:
-        break
+# outer loop keeps cycling through the dataloader until max_steps is reached
+# without this the model only sees the data once (27 batches) not 5000 steps
+while step < max_steps:
+    for x, y in train_loader:
+        if step >= max_steps:
+            break
 
-    x = x.to(device)
-    y = y.to(device)
+        x = x.to(device)
+        y = y.to(device)
 
-    logits = model(x)
+        logits  = model(x)
+        B, T, C = logits.shape
 
-    # Cross entropy loss — measures how well the model predicts the next token
-    # logits and targets must be 2D and 1D respectively
-    B, T, C = logits.shape
-    loss = F.cross_entropy(
-        logits.view(B * T, C),
-        y.view(B * T)
-    )
+        # Cross entropy loss — measures how well the model predicts the next token
+        # logits and targets must be 2D and 1D respectively
+        loss = F.cross_entropy(
+            logits.view(B * T, C),
+            y.view(B * T)
+        )
 
-    optimizer.zero_grad()
-    loss.backward()
-    optimizer.step()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-    if step % 200 == 0:
-        print(f"Step {step}, Loss: {loss.item():.4f}")
+        if step % 200 == 0:
+            print(f"Step {step}, Loss: {loss.item():.4f}")
+
+        step += 1
 
 
-# ─── Generation ────────────────────────────────────────────────
+# ─── Generation ───────────────────────────────────────────────────────────────
+
+def generate(model, tokenizer, prompt, max_new_tokens=50):
+    model.eval()
+    device = next(model.parameters()).device
+
+    # Encode prompt and add batch dimension
+    tokens = tokenizer.encode(prompt)
+    x      = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
+
+    with torch.no_grad():
+        for _ in range(max_new_tokens):
+            # Crop to block_size — model can only see block_size tokens at a time
+            x_cond = x[:, -block_size:]
+            logits = model(x_cond)
+
+            # Take logits for the last token position only
+            logits     = logits[:, -1, :]
+            probs      = torch.softmax(logits, dim=-1)
+
+            # Greedy decoding — always pick the most likely next token
+            next_token = torch.argmax(probs, dim=-1, keepdim=True)
+            x          = torch.cat([x, next_token], dim=1)
+
+    return tokenizer.decode(x[0].tolist())
+
+
+# ─── Test Generation ──────────────────────────────────────────────----------------------------------------------------------------
+
+prompt = "The lighthouse"
+
+print(generate(model, tokenizer, prompt, max_new_tokens=15))
+print(generate(model, tokenizer, prompt, max_new_tokens=50))

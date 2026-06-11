@@ -121,12 +121,12 @@ print(output)
 
 # ─── Parameter Comparison ─────────────────────────────────────────────────────
 
-def count_params(model):
-    return sum(p.numel() for p in model.parameters())
+# def count_params(model):
+#     return sum(p.numel() for p in model.parameters())
 
-mha = MaskedMultiHeadAttention(d_model=6, num_heads=6)
-gqa = GroupedQueryAttention(d_model=6, num_heads=6, num_kv_heads=2)
+# mha = MaskedMultiHeadAttention(d_model=6, num_heads=6)
+# gqa = GroupedQueryAttention(d_model=6, num_heads=6, num_kv_heads=2)
 
-print(f"\nMHA parameters:  {count_params(mha)}")
-print(f"GQA parameters:  {count_params(gqa)}")
-print(f"MQA parameters:  {count_params(mqa)}")
+# print(f"\nMHA parameters:  {count_params(mha)}")
+# print(f"GQA parameters:  {count_params(gqa)}")
+# print(f"MQA parameters:  {count_params(mqa)}")

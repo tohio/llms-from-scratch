@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
 import tiktoken
 from torch.utils.data import Dataset, DataLoader
@@ -36,24 +35,6 @@ class TinyCorpusDataset(Dataset):
         x = self.data[idx:idx + self.block_size]
         y = self.data[idx + 1:idx + self.block_size + 1]
         return x, y
-
-
-# ─── RMS Normalisation ────────────────────────────────────────────────────────
-
-class RMSNorm(nn.Module):
-    def __init__(self, d_model, eps=1e-8):
-        super().__init__()
-        self.eps   = eps
-
-        # Learnable scale parameter — no bias, RMSNorm only scales
-        self.scale = nn.Parameter(torch.ones(d_model))
-
-    def forward(self, x):
-        # Compute root mean square across the embedding dimension
-        rms = x.pow(2).mean(dim=-1, keepdim=True).sqrt()
-
-        # Normalise by RMS then apply learnable scale
-        return self.scale * x / (rms + self.eps)
 
 
 # ─── RoPE ─────────────────────────────────────────────────────────────────────
@@ -175,73 +156,151 @@ class GroupedQueryAttention(nn.Module):
         return self.out_proj(context)
 
 
-# ─── Feed Forward Network with SwiGLU ────────────────────────────────────────
+# ─── Expert ───────────────────────────────────────────────────────────────────
 
-class FeedForward(nn.Module):
-    def __init__(self, d_model):
+class Expert(nn.Module):
+    def __init__(self, d_model, hidden_dim):
         super().__init__()
 
-        # SwiGLU uses 8/3 * d_model for hidden dim instead of 4x
-        hidden_dim = int(d_model * 8 / 3)
-
-        # Gate and value projections — run in parallel, multiplied together
-        # gating mechanism gives SwiGLU more expressiveness than plain GELU
+        # Each expert is an independent SwiGLU FFN
+        # same architecture as LLaMA's FeedForward — only the routing changes
         self.w_gate  = nn.Linear(d_model, hidden_dim, bias=False)
         self.w_value = nn.Linear(d_model, hidden_dim, bias=False)
-
-        # Output projection — contracts back to d_model
         self.w_out   = nn.Linear(hidden_dim, d_model, bias=False)
 
     def forward(self, x):
         # SwiGLU: (Swish(gate) * value) → output
-        # Swish is x * sigmoid(x), equivalent to F.silu
-        gate  = F.silu(self.w_gate(x))   # Swish activation on gate branch
-        value = self.w_value(x)           # linear value branch
-        return self.w_out(gate * value)   # element-wise gating then project
+        gate  = F.silu(self.w_gate(x))
+        value = self.w_value(x)
+        return self.w_out(gate * value)
 
 
-# ─── Transformer Block (LLaMA style) ─────────────────────────────────────────
+# ─── Router ───────────────────────────────────────────────────────────────────
+
+class Router(nn.Module):
+    def __init__(self, d_model, num_experts):
+        super().__init__()
+
+        # Linear layer that scores each token against each expert
+        self.gate = nn.Linear(d_model, num_experts, bias=False)
+
+    def forward(self, x, top_k):
+        # Compute raw scores for each expert
+        logits = self.gate(x)
+
+        # Convert to probabilities
+        probs = torch.softmax(logits, dim=-1)
+
+        # Select top_k experts per token
+        weights, indices = torch.topk(probs, k=top_k, dim=-1)
+
+        # Renormalise weights so they sum to 1 across selected experts
+        weights = weights / weights.sum(dim=-1, keepdim=True)
+
+        return weights, indices
+
+
+# ─── Mixture of Experts FFN ───────────────────────────────────────────────────
+
+class MoE(nn.Module):
+    def __init__(self, d_model, hidden_dim, num_experts, top_k):
+        super().__init__()
+
+        assert top_k <= num_experts, "top_k cannot exceed num_experts"
+
+        self.d_model     = d_model
+        self.num_experts = num_experts
+        self.top_k       = top_k
+
+        # Pool of expert FFNs — each learns different transformations
+        self.experts = nn.ModuleList([
+            Expert(d_model, hidden_dim)
+            for _ in range(num_experts)
+        ])
+
+        # Router — decides which experts handle each token
+        self.router = Router(d_model, num_experts)
+
+    def forward(self, x):
+        b, seq_len, d_model = x.shape
+
+        # Flatten batch and sequence dimensions for routing
+        # shape: (batch * seq_len, d_model)
+        x_flat = x.view(-1, d_model)
+
+        # Get expert weights and indices for each token
+        # weights shape: (batch * seq_len, top_k)
+        # indices shape: (batch * seq_len, top_k)
+        weights, indices = self.router(x_flat, self.top_k)
+
+        # Accumulate weighted expert outputs
+        output = torch.zeros_like(x_flat)
+
+        for k in range(self.top_k):
+            expert_idx = indices[:, k]   # (batch * seq_len,)
+            weight     = weights[:, k]   # (batch * seq_len,)
+
+            for i in range(self.num_experts):
+                # Find which tokens are assigned to expert i for this slot
+                token_mask = (expert_idx == i)
+
+                if token_mask.any():
+                    expert_output          = self.experts[i](x_flat[token_mask])
+                    output[token_mask]    += weight[token_mask].unsqueeze(-1) * expert_output
+
+        # Restore original shape
+        return output.view(b, seq_len, d_model)
+
+
+# ─── Transformer Block (LLaMA 4 style — GQA + RoPE + RMSNorm + MoE) ─────────
 
 class TransformerBlock(nn.Module):
-    def __init__(self, embed_dim, num_heads, num_kv_heads):
+    def __init__(self, embed_dim, num_heads, num_kv_heads, num_experts, top_k):
         super().__init__()
 
         self.attention = GroupedQueryAttention(embed_dim, num_heads, num_kv_heads)
-        self.ffn       = FeedForward(embed_dim)
+
+        # MoE replaces the standard FFN — same slot, different internals
+        # hidden_dim follows LLaMA convention of 8/3 * d_model per expert
+        self.moe = MoE(
+            d_model     = embed_dim,
+            hidden_dim  = int(embed_dim * 8 / 3),
+            num_experts = num_experts,
+            top_k       = top_k
+        )
 
         # RMSNorm — Pre-LN position, lighter than LayerNorm
-        # used in LLaMA, Mistral, and most modern architectures
-        self.norm1 = RMSNorm(embed_dim)
-        self.norm2 = RMSNorm(embed_dim)
+        self.norm1 = nn.RMSNorm(embed_dim)
+        self.norm2 = nn.RMSNorm(embed_dim)
 
     def forward(self, x):
         # Pre-LN: normalise → attention → residual
         x = x + self.attention(self.norm1(x))
 
-        # Pre-LN: normalise → FFN → residual
-        x = x + self.ffn(self.norm2(x))
+        # Pre-LN: normalise → MoE FFN → residual
+        # MoE sits in the exact same position as a standard FFN
+        x = x + self.moe(self.norm2(x))
 
         return x
 
 
-# ─── MiniLLaMA ────────────────────────────────────────────────────────────────
+# ─── MiniLLaMA MoE ────────────────────────────────────────────────────────────
 
-class MiniLLaMA(nn.Module):
-    def __init__(self, vocab_size, embed_dim, num_heads, num_kv_heads, num_layers):
+class MiniLLaMAMoE(nn.Module):
+    def __init__(self, vocab_size, embed_dim, num_heads, num_kv_heads, num_layers, num_experts, top_k):
         super().__init__()
 
         # Token embedding only — RoPE handles position inside attention
-        # no positional embedding layer needed
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
 
-        # Stack of LLaMA-style transformer blocks
+        # Stack of LLaMA 4 style transformer blocks with MoE FFN
         self.blocks = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, num_kv_heads)
+            TransformerBlock(embed_dim, num_heads, num_kv_heads, num_experts, top_k)
             for _ in range(num_layers)
         ])
 
         # Final RMSNorm before the language model head
-        self.final_norm = RMSNorm(embed_dim)
+        self.final_norm = nn.RMSNorm(embed_dim)
 
         # Language model head — projects embed_dim → vocab_size to produce logits
         self.lm_head = nn.Linear(embed_dim, vocab_size, bias=False)
@@ -270,15 +329,23 @@ torch.manual_seed(123)
 block_size = 4
 tokenizer  = tiktoken.encoding_for_model("gpt-4o")
 
-model = MiniLLaMA(
+model = MiniLLaMAMoE(
     vocab_size   = tokenizer.n_vocab,
     embed_dim    = 32,
     num_heads    = 4,
-    num_kv_heads = 2,   # 2 KV heads — each shared by 2 Q heads
-    num_layers   = 2
+    num_kv_heads = 2,    # 2 KV heads — each shared by 2 Q heads
+    num_layers   = 2,
+    num_experts  = 8,    # 8 experts per layer — same as LLaMA 4 Scout
+    top_k        = 2     # each token routed to 2 experts
 )
 
 print(model)
+
+# Print parameter breakdown
+total_params  = sum(p.numel() for p in model.parameters())
+active_params = sum(p.numel() for p in model.blocks[0].moe.experts[0].parameters()) * 2
+print(f"\nTotal parameters:         {total_params:,}")
+print(f"Active MoE params/token:  {active_params:,} ({100 * active_params / total_params:.1f}% of total)")
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 model  = model.to(device)
@@ -301,7 +368,7 @@ val_dataset   = torch.utils.data.Subset(dataset, range(split_idx, len(dataset)))
 train_loader  = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 val_loader    = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False)
 
-print(f"Train sequences:      {len(train_dataset)}")
+print(f"\nTrain sequences:      {len(train_dataset)}")
 print(f"Validation sequences: {len(val_dataset)}")
 print(f"Batches per epoch:    {len(train_loader)}")
 
@@ -312,7 +379,6 @@ model.train()
 step = 0
 
 # outer loop keeps cycling through the dataloader until max_steps is reached
-# without this the model only sees the data once (27 batches) not 5000 steps
 while step < max_steps:
     for x, y in train_loader:
         if step >= max_steps:
@@ -325,7 +391,6 @@ while step < max_steps:
         B, T, C = logits.shape
 
         # Cross entropy loss — measures how well the model predicts the next token
-        # logits and targets must be 2D and 1D respectively
         loss = F.cross_entropy(
             logits.view(B * T, C),
             y.view(B * T)

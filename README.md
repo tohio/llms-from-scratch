@@ -12,11 +12,11 @@ and PyTorch native equivalents for direct comparison.
 | `tokenizer/` | Character tokenizer, custom BPE, tiktoken wrapper |
 | `embeddings/` | Token embeddings, positional embeddings, RoPE |
 | `attention/` | Self attention, MHA, GQA, MQA |
-| `feed_forward_network/` | GELU FFN, SwiGLU FFN |
+| `feed_forward_network/` | GELU FFN, SwiGLU FFN, MoE |
 | `layer_norm/` | LayerNorm, RMSNorm |
 | `residual_connections/` | Residual connection examples |
 | `transformer/` | GPT-style and LLaMA-style transformer blocks |
-| `minigpt/` | MiniGPT and MiniLLaMA — full trainable models |
+| `minigpt/` | MiniGPT, MiniLLaMA, MiniLLaMAMoE — full trainable models |
 | `pytorch_native/` | GPT and LLaMA rebuilt using PyTorch native components |
 | `datasets/` | Custom PyTorch dataset, HuggingFace dataset, HF Hub dataset |
 | `inference/` | Greedy, temperature, top-k, top-p, repetition penalty, beam search |
@@ -76,6 +76,12 @@ python attention/group_query_attention.py
 python attention/multi_query_attention.py
 ```
 
+**Feed Forward Networks:**
+```bash
+python feed_forward_network/ffn.py
+python feed_forward_network/moe.py
+```
+
 **Transformer Blocks:**
 ```bash
 python transformer/transformer.py
@@ -86,6 +92,7 @@ python transformer/transformer_llama.py
 ```bash
 python minigpt/gpt.py
 python minigpt/llama.py
+python minigpt/llama_moe.py
 ```
 
 **PyTorch Native Models:**
@@ -135,6 +142,17 @@ A LLaMA-style language model — same training setup, modern architecture choice
 | Normalisation | RMSNorm |
 | FFN | SwiGLU |
 
+### MiniLLaMAMoE
+A LLaMA 4-style model — replaces the dense FFN with a Mixture of Experts layer.
+
+| Component | Implementation |
+|-----------|---------------|
+| Tokenizer | tiktoken (GPT-4o) |
+| Positional Encoding | RoPE (Rotary Position Embedding) |
+| Attention | Grouped Query Attention |
+| Normalisation | RMSNorm |
+| FFN | MoE (8 experts, top-2 routing) |
+
 ### PyTorch Native
 Both models rebuilt using PyTorch native components for direct comparison
 with the manual implementations.
@@ -145,6 +163,16 @@ with the manual implementations.
 | Normalisation | `nn.LayerNorm` | `nn.RMSNorm` |
 | FFN | `nn.TransformerEncoderLayer` | SwiGLU |
 | Position | Learned embeddings | RoPE |
+
+## Model Comparison
+
+Results on `tiny_corpus.txt` after 5000 training steps with identical hyperparameters.
+
+| Model | Final Loss | Architecture |
+|-------|-----------|--------------|
+| MiniGPT | 0.5097 | MHA + LayerNorm + GELU |
+| MiniLLaMA | 0.4221 | GQA + RMSNorm + SwiGLU + RoPE |
+| MiniLLaMAMoE | 0.3847 | GQA + RMSNorm + MoE + RoPE |
 
 ## Inference Techniques
 

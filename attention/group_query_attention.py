@@ -133,12 +133,12 @@ print(output)
 # ─── Comparison ───────────────────────────────────────────────────────────────
 
 # Parameter count comparison — GQA is more memory efficient
-def count_params(model):
-    return sum(p.numel() for p in model.parameters())
+# def count_params(model):
+#     return sum(p.numel() for p in model.parameters())
 
-from embeddings.attention import MaskedMultiHeadAttention  # your existing file
+# from embeddings.attention import MaskedMultiHeadAttention  
 
-mha = MaskedMultiHeadAttention(d_model=6, num_heads=6)
-print(f"\nMHA parameters:  {count_params(mha)}")
-print(f"GQA parameters:  {count_params(gqa)}")
-print(f"K/V param reduction: {1 - (gqa.num_kv_heads / gqa.num_heads):.0%}")
+# mha = MaskedMultiHeadAttention(d_model=6, num_heads=6)
+# print(f"\nMHA parameters:  {count_params(mha)}")
+# print(f"GQA parameters:  {count_params(gqa)}")
+# print(f"K/V param reduction: {1 - (gqa.num_kv_heads / gqa.num_heads):.0%}")
