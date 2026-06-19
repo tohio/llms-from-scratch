@@ -47,11 +47,21 @@ block_size = 128
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-# Corpus — swap URL and PATH to use a different book or dataset
-# any plain text file from Project Gutenberg works here
-CORPUS_URL  = "https://www.gutenberg.org/files/1661/1661-0.txt"
-CORPUS_PATH = "../data/sherlock_corpus.txt"
-MODEL_SAVE  = "../data/reasoning_model.pt"
+# Two complementary reasoning corpora from Project Gutenberg
+# Sherlock Holmes — deductive reasoning (specific clues → single conclusion)
+# Darwin — inductive reasoning (many observations → general theory)
+# together they cover both directions of reasoning
+# swap URLs and paths to use different books
+CORPUS_URLS = {
+    "sherlock": "https://www.gutenberg.org/files/1661/1661-0.txt",
+    "darwin":   "https://www.gutenberg.org/files/1228/1228-0.txt"
+}
+CORPUS_PATHS = {
+    "sherlock": "../data/sherlock_corpus.txt",
+    "darwin":   "../data/darwin_corpus.txt"
+}
+COMBINED_CORPUS_PATH = "../data/reasoning_corpus.txt"
+MODEL_SAVE           = "../data/reasoning_model.pt"
 
 batch_size    = 16
 max_steps     = 10000
@@ -66,29 +76,50 @@ tokenizer = tiktoken.encoding_for_model("gpt-4o")
 
 # ─── Corpus ───────────────────────────────────────────────────────────────────
 
-def download_corpus():
-    # Download corpus from Project Gutenberg
-    # only downloads if not already present — subsequent runs skip this step
-    # swap CORPUS_URL and CORPUS_PATH at the top to use a different book
-    if not os.path.exists(CORPUS_PATH):
-        print(f"Downloading corpus to {CORPUS_PATH}...")
-        urllib.request.urlretrieve(CORPUS_URL, CORPUS_PATH)
-        print("Download complete")
-    else:
-        print(f"Corpus already exists at {CORPUS_PATH}")
-
-    with open(CORPUS_PATH, "r", encoding="utf8") as f:
-        text = f.read()
-
+def strip_gutenberg(text):
     # Strip Project Gutenberg header and footer
-    # the actual story starts and ends at the *** markers
+    # the actual content sits between the *** markers
     start = text.find("*** START OF")
     end   = text.find("*** END OF")
     if start != -1 and end != -1:
         text = text[start:end]
+    return text.strip()
 
-    print(f"Corpus size: {len(text):,} characters")
-    return text
+
+def download_corpus():
+    # Download both corpora from Project Gutenberg
+    # only downloads if not already present — subsequent runs skip this step
+    # swap CORPUS_URLS and CORPUS_PATHS at the top to use different books
+    combined = []
+
+    for name, url in CORPUS_URLS.items():
+        path = CORPUS_PATHS[name]
+
+        if not os.path.exists(path):
+            print(f"Downloading {name} corpus...")
+            urllib.request.urlretrieve(url, path)
+            print(f"Saved to {path}")
+        else:
+            print(f"{name} corpus already exists at {path}")
+
+        with open(path, "r", encoding="utf8") as f:
+            text = f.read()
+
+        text = strip_gutenberg(text)
+        combined.append(text)
+        print(f"{name}: {len(text):,} characters")
+
+    # Concatenate both corpora into one training corpus
+    # separator helps the model distinguish between the two sources
+    full_text = "\n\n---\n\n".join(combined)
+
+    # Save combined corpus for reference
+    with open(COMBINED_CORPUS_PATH, "w", encoding="utf8") as f:
+        f.write(full_text)
+
+    print(f"\nCombined corpus: {len(full_text):,} characters")
+    print(f"Saved to {COMBINED_CORPUS_PATH}")
+    return full_text
 
 
 # ─── Dataset ──────────────────────────────────────────────────────────────────
@@ -256,23 +287,34 @@ def chain_of_thought(model):
     # before giving a final answer
     # the prompt format guides the model to show its reasoning process
     # CoT works best when the base model has seen reasoning patterns in training
-    # Sherlock Holmes is ideal — he always observes → deduces → concludes
-    # swap the prompt to test CoT on different reasoning domains
+    # Sherlock Holmes — deductive: specific clues → single conclusion
+    # Darwin — inductive: many observations → general theory
+    # both patterns are now in the training corpus
     print("=" * 60)
     print("Technique 1 — Chain of Thought (CoT)")
     print("=" * 60)
     print("CoT prompts the model to show its reasoning step by step")
     print("before arriving at a conclusion.\n")
 
-    prompt = (
+    # Deductive prompt — Sherlock style
+    prompt_deductive = (
         "Holmes looked carefully at the visitor and said:\n"
         "Let me think through this step by step.\n"
         "First, I observe that"
     )
 
-    print(f"Prompt:\n{prompt}\n")
-    output = generate(model, prompt, max_new_tokens=300)
-    print(f"Output:\n{output}\n")
+    # Inductive prompt — Darwin style
+    prompt_inductive = (
+        "Having observed these facts across many specimens, I am led to conclude:\n"
+        "First, it is clear that"
+    )
+
+    print(f"Deductive prompt (Sherlock):\n{prompt_deductive}\n")
+    print(generate(model, prompt_deductive, max_new_tokens=200))
+
+    print(f"\nInductive prompt (Darwin):\n{prompt_inductive}\n")
+    print(generate(model, prompt_inductive, max_new_tokens=200))
+    print()
 
 
 # ─── Technique 2 — Self Consistency ──────────────────────────────────────────
@@ -332,12 +374,16 @@ def react(model):
     def mock_tool(action):
         # in production this calls a real search engine, database, or API
         # the tool result becomes the next observation in the reasoning loop
+        # observations drawn from both corpora — deductive and inductive reasoning
         import random
         observations = [
             "The footprints suggest a man of medium height who walks with a slight limp.",
             "The letter was written hastily — the ink is smudged on the right side.",
             "The suspect was seen leaving Baker Street at half past nine.",
             "The tobacco ash is consistent with a Trichinopoly cigar.",
+            "Specimens from three separate islands show identical variations in beak structure.",
+            "The fossil record indicates a gradual transition over many generations.",
+            "Cross-breeding experiments confirm the trait is inherited rather than acquired.",
         ]
         return random.choice(observations)
 
@@ -430,6 +476,9 @@ if __name__ == "__main__":
     torch.manual_seed(123)
 
     # ── Download and prepare corpus ───────────────────────────────────────────
+    # Sherlock Holmes — deductive reasoning patterns
+    # Darwin — inductive reasoning patterns
+    # combined into one training corpus
     text = download_corpus()
     data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
 
