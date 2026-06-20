@@ -249,11 +249,10 @@ def load_dolma(n_samples):
     print("\nLoading Dolma...")
     # allenai/dolma requires a dataset script which is no longer supported
     # by newer versions of the datasets library.
-    # allenai/dolma-pes2o is a subset of Dolma (peS2o — scientific papers)
-    # that loads as a standard parquet dataset with no script required
-    # it is diverse, high quality web text — a good raw source for curation
+    # emozilla/dolma-v1_7-c4 is a native parquet mirror of the Dolma C4
+    # subset — loads without a script, same diverse web text content
     dataset = load_dataset(
-        "allenai/dolma-pes2o",
+        "emozilla/dolma-v1_7-c4",
         split     = "train",
         streaming = True
     )
