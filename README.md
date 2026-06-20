@@ -16,14 +16,14 @@ and PyTorch native equivalents for direct comparison.
 | `layer_norm/` | LayerNorm, RMSNorm |
 | `residual_connections/` | Residual connection examples |
 | `transformer/` | GPT-style and LLaMA-style transformer blocks |
-| `minigpt/` | MiniGPT, MiniLLaMA, MiniLLaMAMoE — full trainable models |
+| `minigpt/` | MiniGPT, MiniLLaMA, MiniLLaMAMoE, logit distillation, feature distillation |
 | `pytorch_native/` | GPT and LLaMA rebuilt using PyTorch native components |
 | `datasets/` | Custom PyTorch dataset, HuggingFace dataset, HF Hub dataset |
 | `inference/` | Greedy, temperature, top-k, top-p, repetition penalty, beam search |
 | `data_curation/` | Pretraining, SFT, and DPO data curation pipelines |
-| `sft/` | Supervised fine tuning — three stage pipeline |
+| `sft/` | Supervised fine tuning — pretrain then SFT |
 | `dpo/` | DPO alignment — pretrain, SFT, and DPO in one file |
-| `reasoning/` | Chain of Thought, Self Consistency, ReAct, Tree of Thought |
+| `reasoning/` | Prompting techniques and full reasoning model training pipeline |
 | `data/` | Training corpora and dataset files |
 
 ## Quick Start
@@ -99,6 +99,12 @@ python minigpt/llama.py
 python minigpt/llama_moe.py
 ```
 
+**Distillation:**
+```bash
+python minigpt/distillation_logits.py
+python minigpt/distillation_features.py
+```
+
 **PyTorch Native Models:**
 ```bash
 python pytorch_native/gpt.py
@@ -139,9 +145,14 @@ python sft/sft.py
 python dpo/dpo.py
 ```
 
-**Reasoning:**
+**Reasoning — Prompting Techniques:**
 ```bash
-python reasoning/reasoning.py
+python reasoning/reasoning_prompt.py
+```
+
+**Reasoning — Full Reasoning Model:**
+```bash
+python reasoning/reasoning_model.py
 ```
 
 ## Models
@@ -190,6 +201,16 @@ with the manual implementations.
 | FFN | `nn.TransformerEncoderLayer` | SwiGLU |
 | Position | Learned embeddings | RoPE |
 
+### Distillation
+Two distillation approaches — logit distillation (Hinton 2015) and feature distillation (TinyBERT/DistilBERT style).
+
+| Approach | Script | Loss |
+|----------|--------|------|
+| Logit distillation | `minigpt/distillation_logits.py` | Hard CE + soft KL divergence |
+| Feature distillation | `minigpt/distillation_features.py` | Hard CE + MSE on hidden states |
+
+Both use a teacher/student setup — teacher trains first, student learns from teacher outputs.
+
 ## Model Comparison
 
 Results on `tiny_corpus.txt` after 5000 training steps with identical hyperparameters.
@@ -214,6 +235,17 @@ through to preference alignment.
 | SFT | `sft/sft.py` | Fine tune on instruction/response pairs |
 | DPO | `dpo/dpo.py` | Align using chosen/rejected preference pairs |
 
+## Reasoning Model Pipeline
+
+A three-stage pipeline for training a reasoning model — pretraining, SFT on
+reasoning traces, and RL with GRPO.
+
+| Stage | Script | Dataset | Description |
+|-------|--------|---------|-------------|
+| Pretrain | `reasoning/reasoning_model.py` | Sherlock + Darwin | General language and reasoning patterns |
+| SFT | `reasoning/reasoning_model.py` | Nemotron chat | Teaches `<think>` format and controllable reasoning on/off |
+| GRPO | `reasoning/reasoning_model.py` | Nemotron math | Rewards correct `\boxed{}` answers — verifiable RL signal |
+
 ## Inference Techniques
 
 | Technique | Description |
@@ -227,12 +259,17 @@ through to preference alignment.
 
 ## Reasoning Techniques
 
+`reasoning/reasoning_prompt.py` demonstrates four prompting techniques on a pretrained model.
+
 | Technique | Description |
 |-----------|-------------|
 | Chain of Thought | Prompts the model to reason step by step before answering |
 | Self Consistency | Samples multiple reasoning paths and takes a majority vote |
 | ReAct | Interleaves reasoning with actions and observations |
 | Tree of Thought | Explores multiple reasoning branches and keeps the most promising |
+
+`reasoning/reasoning_model.py` trains an actual reasoning model using SFT on real CoT traces
+and GRPO reinforcement learning with a verifiable reward signal.
 
 ## Data Files
 
@@ -241,7 +278,9 @@ through to preference alignment.
 | `data/tiny_corpus.txt` | — | pretraining, SFT, DPO, inference |
 | `data/sft_dataset.jsonl` | — | `sft/sft.py` |
 | `data/dpo_dataset.jsonl` | — | `dpo/dpo.py` |
-| `data/sherlock_corpus.txt` | `reasoning/reasoning.py` | `reasoning/reasoning.py` |
+| `data/sherlock_corpus.txt` | `reasoning/reasoning_prompt.py` | `reasoning/reasoning_prompt.py`, `reasoning/reasoning_model.py`, `minigpt/distillation_logits.py`, `minigpt/distillation_features.py` |
+| `data/darwin_corpus.txt` | `reasoning/reasoning_prompt.py` | `reasoning/reasoning_prompt.py`, `reasoning/reasoning_model.py`, `minigpt/distillation_logits.py`, `minigpt/distillation_features.py` |
+| `data/reasoning_corpus.txt` | `reasoning/reasoning_prompt.py` | `reasoning/reasoning_prompt.py`, `reasoning/reasoning_model.py`, `minigpt/distillation_logits.py`, `minigpt/distillation_features.py` |
 | `data/fineweb_corpus.txt` | `data_curation/pretrain_curate.py` | pretraining |
 | `data/dolma_corpus.txt` | `data_curation/pretrain_curate.py` | pretraining |
 | `data/mixed_corpus.txt` | `data_curation/pretrain_curate.py` | pretraining |
@@ -259,7 +298,7 @@ through to preference alignment.
 - tiktoken
 - datasets (HuggingFace)
 - transformers (HuggingFace)
-- fasttext (data curation)
+- langdetect (data curation language filtering)
 
 ## Install Dependencies
 

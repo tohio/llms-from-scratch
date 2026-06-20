@@ -1,16 +1,14 @@
 import os
 import re
-import json
 import random
+import urllib.request
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import tiktoken
-import urllib.request
 from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
-from transformers import pipeline
 
 
 # ─── Hardware Config ──────────────────────────────────────────────────────────
@@ -59,6 +57,7 @@ grpo_max_steps     = 1000
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 # Pretraining corpora — Sherlock + Darwin, same as reasoning_prompt.py
+# general language understanding before reasoning training
 CORPUS_URLS = {
     "sherlock": "https://www.gutenberg.org/files/1661/1661-0.txt",
     "darwin":   "https://www.gutenberg.org/files/1228/1228-0.txt"
@@ -68,19 +67,29 @@ CORPUS_PATHS = {
     "darwin":   "../data/darwin_corpus.txt"
 }
 COMBINED_CORPUS_PATH = "../data/reasoning_corpus.txt"
+MODEL_SAVE           = "../data/reasoning_model.pt"
 
-# CommonsenseQA traces — generated once and cached to disk
-# generation uses flan-t5-base — small enough to run locally
-# production systems use larger teacher models (GPT-4, Llama-3-70B etc.)
-TRACES_PATH  = "../data/commonsenseqa_traces.jsonl"
-MODEL_SAVE   = "../data/reasoning_model_model.pt"
+# Nemotron dataset config
+# chat — teaches <think> format and controllable reasoning on/off
+# math — provides verifiable answers for GRPO reward signal
+# both filtered to Nano subset — pre-vetted high quality samples
+# used_in_training == "Nano" is the smallest vetted tier in the Nemotron family
+NEMOTRON_DATASET  = "nvidia/Llama-Nemotron-Post-Training-Dataset"
+SFT_SPLIT         = "chat"     # 39k samples — teaches reasoning format
+GRPO_SPLIT        = "math"     # 22M samples — verifiable math answers for RL
+NUM_SFT_SAMPLES   = 500        # stream and take this many chat examples
+NUM_GRPO_SAMPLES  = 200        # stream and take this many math examples
 
-NUM_SAMPLES  = 1000   # how many CommonsenseQA examples to use
-                       # raise for better coverage, lower for faster iteration
-GRPO_GROUPS  = 4      # number of responses sampled per question in GRPO
-                       # more groups = lower variance but slower
-                       # DeepSeek R1 used 8 — 4 is a reasonable tutorial default
-BATCH_SIZE   = 8
+BATCH_SIZE        = 8
+GRPO_GROUPS       = 4          # responses sampled per question in GRPO
+                                # more groups = lower variance, slower per step
+                                # DeepSeek R1 used 8 — 4 is a good tutorial default
+
+# Controllable reasoning system prompts — from the Nemotron paper
+# the model learns to toggle reasoning on/off based on the system prompt
+# this is the key innovation of Llama Nemotron vs standard reasoning models
+THINKING_ON  = "detailed thinking on"
+THINKING_OFF = "detailed thinking off"
 
 
 # ─── Tokenizer ────────────────────────────────────────────────────────────────
@@ -99,8 +108,8 @@ def strip_gutenberg(text):
 
 
 def download_corpus():
-    # Download Sherlock + Darwin — same combined corpus as reasoning_prompt.py
-    # reuses cached files if already downloaded
+    # Download Sherlock + Darwin — reuses cached files if already present
+    # same combined corpus as reasoning_prompt.py
     combined = []
 
     for name, url in CORPUS_URLS.items():
@@ -109,7 +118,6 @@ def download_corpus():
         if not os.path.exists(path):
             print(f"Downloading {name} corpus...")
             urllib.request.urlretrieve(url, path)
-            print(f"Saved to {path}")
         else:
             print(f"{name} corpus already exists at {path}")
 
@@ -121,7 +129,7 @@ def download_corpus():
         print(f"{name}: {len(text):,} characters")
 
     if os.path.exists(COMBINED_CORPUS_PATH):
-        print(f"\nCombined corpus already exists at {COMBINED_CORPUS_PATH}")
+        print(f"Combined corpus already exists at {COMBINED_CORPUS_PATH}")
         with open(COMBINED_CORPUS_PATH, "r", encoding="utf8") as f:
             return f.read()
 
@@ -130,96 +138,133 @@ def download_corpus():
     with open(COMBINED_CORPUS_PATH, "w", encoding="utf8") as f:
         f.write(full_text)
 
-    print(f"\nCombined corpus: {len(full_text):,} characters")
+    print(f"Combined corpus: {len(full_text):,} characters")
     return full_text
 
 
-# ─── Trace Generation — SFT Data Preparation ─────────────────────────────────
+# ─── Nemotron Data Loading ─────────────────────────────────────────────────────
 
-def format_choices(choices):
-    # Format multiple choice options as a readable string
-    labels = choices["label"]
-    texts  = choices["text"]
-    return " ".join(f"{l}) {t}" for l, t in zip(labels, texts))
+def load_sft_data(n_samples):
+    # Load chat split from Nemotron dataset
+    # filter to Nano-vetted samples only — highest quality tier
+    # balance reasoning on/off — teaches controllable reasoning
+    # skip samples with empty <think></think> — these are refusal samples
+    print(f"\nLoading Nemotron SFT data ({SFT_SPLIT} split, Nano subset)...")
 
-
-def generate_traces(n_samples):
-    # Generate reasoning traces for CommonsenseQA using flan-t5-base
-    # flan-t5-base is instruction-tuned — it can produce step-by-step reasoning
-    # without needing few-shot prompting
-    # traces are saved to disk after generation so this only runs once
-    # production systems use larger teacher models for higher quality traces
-
-    if os.path.exists(TRACES_PATH):
-        print(f"Traces already exist at {TRACES_PATH} — loading from disk")
-        traces = []
-        with open(TRACES_PATH, "r", encoding="utf8") as f:
-            for line in f:
-                traces.append(json.loads(line.strip()))
-        print(f"Loaded {len(traces)} traces")
-        return traces
-
-    print(f"\nGenerating reasoning traces for {n_samples} CommonsenseQA examples...")
-    print("Using flan-t5-base — this runs once and caches to disk\n")
-
-    # Load flan-t5-base on CPU — small enough, avoids device conflicts
-    # alternative: use a larger model (flan-t5-xl, Mistral-7B) for better traces
-    generator = pipeline(
-        "text2text-generation",
-        model  = "google/flan-t5-base",
-        device = -1    # CPU — avoids device conflicts with the main model
+    dataset = load_dataset(
+        NEMOTRON_DATASET,
+        "SFT",
+        split     = SFT_SPLIT,
+        streaming = True
     )
 
-    dataset = load_dataset("tau/commonsense_qa", split=f"train[:{n_samples}]")
+    on_samples  = []
+    off_samples = []
 
-    traces = []
-    for i, example in enumerate(dataset):
-        question       = example["question"]
-        choices_str    = format_choices(example["choices"])
-        answer_key     = example["answerKey"]
+    for example in dataset:
+        if len(on_samples) + len(off_samples) >= n_samples * 2:
+            break
 
-        # Ask flan-t5 to reason through the question step by step
-        # the prompt format follows the original CoT paper (Wei et al. 2022)
-        prompt = (
-            f"Question: {question}\n"
-            f"Choices: {choices_str}\n"
-            f"Let's think step by step."
-        )
+        # Filter to Nano-vetted samples only
+        used_in = example.get("used_in_training", "")
+        if "Nano" not in used_in:
+            continue
 
-        try:
-            result = generator(prompt, max_new_tokens=128, do_sample=False)[0]
-            trace  = result["generated_text"].strip()
-        except Exception:
-            # if generation fails fall back to a minimal trace
-            trace = f"The answer is {answer_key}."
+        reasoning     = example.get("reasoning", "")
+        output        = example.get("output",    "")
+        input_msgs    = example.get("input",     [])
+        system_prompt = example.get("system_prompt", "")
 
-        # Full SFT format: question + choices + trace + final answer
-        # <think> tags mirror the R1 format — easy to extract answer at inference
-        sft_text = (
-            f"Question: {question}\n"
-            f"Choices: {choices_str}\n"
-            f"<think>\n{trace}\n</think>\n"
-            f"Answer: {answer_key}"
-        )
+        if not input_msgs or not output:
+            continue
 
-        traces.append({
-            "question":   question,
-            "choices":    choices_str,
-            "answer":     answer_key,
-            "trace":      trace,
-            "sft_text":   sft_text
+        # Skip empty think tags — these are typically refusal samples
+        if reasoning == "on" and "<think></think>" in output:
+            continue
+
+        # Extract user message from the input list
+        user_msg = ""
+        for msg in input_msgs:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                user_msg = msg.get("content", "")
+                break
+
+        if not user_msg:
+            continue
+
+        sample = {
+            "system_prompt": system_prompt,
+            "user":          user_msg,
+            "output":        output,
+            "reasoning":     reasoning
+        }
+
+        if reasoning == "on" and len(on_samples) < n_samples // 2:
+            on_samples.append(sample)
+        elif reasoning == "off" and len(off_samples) < n_samples // 2:
+            off_samples.append(sample)
+
+    # Interleave on/off samples — curriculum: easier off samples mixed with harder on samples
+    samples = []
+    for on, off in zip(on_samples, off_samples):
+        samples.append(off)   # reasoning off first — simpler, no trace needed
+        samples.append(on)    # reasoning on second — requires <think> trace
+
+    print(f"Loaded {len(samples)} SFT samples ({len(on_samples)} reasoning on, {len(off_samples)} reasoning off)")
+    return samples
+
+
+def load_grpo_data(n_samples):
+    # Load math split for GRPO — math has verifiable \boxed{} answers
+    # GRPO needs a ground truth reward signal — format reward alone is not enough
+    # math answers are objectively right or wrong — perfect for binary reward
+    print(f"\nLoading Nemotron GRPO data ({GRPO_SPLIT} split, Nano subset)...")
+
+    dataset = load_dataset(
+        NEMOTRON_DATASET,
+        "SFT",
+        split     = GRPO_SPLIT,
+        streaming = True
+    )
+
+    samples = []
+
+    for example in dataset:
+        if len(samples) >= n_samples:
+            break
+
+        used_in   = example.get("used_in_training", "")
+        reasoning = example.get("reasoning", "")
+        output    = example.get("output",    "")
+        input_msgs = example.get("input",    [])
+
+        # GRPO only on reasoning-on math samples — we need <think> traces + \boxed{} answers
+        if "Nano" not in used_in:
+            continue
+        if reasoning != "on":
+            continue
+        if not output or "<think></think>" in output:
+            continue
+        if not extract_boxed_answer(output):
+            continue    # skip if no \boxed{} answer — can't verify
+
+        user_msg = ""
+        for msg in input_msgs:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                user_msg = msg.get("content", "")
+                break
+
+        if not user_msg:
+            continue
+
+        samples.append({
+            "user":   user_msg,
+            "output": output,
+            "answer": extract_boxed_answer(output)
         })
 
-        if (i + 1) % 100 == 0:
-            print(f"  Generated {i + 1}/{n_samples} traces")
-
-    # Save to disk — subsequent runs skip generation entirely
-    with open(TRACES_PATH, "w", encoding="utf8") as f:
-        for t in traces:
-            f.write(json.dumps(t) + "\n")
-
-    print(f"\nTraces saved to {TRACES_PATH}")
-    return traces
+    print(f"Loaded {len(samples)} GRPO math samples")
+    return samples
 
 
 # ─── Datasets ─────────────────────────────────────────────────────────────────
@@ -239,12 +284,23 @@ class PretrainDataset(Dataset):
 
 
 class SFTDataset(Dataset):
-    def __init__(self, traces, tokenizer, block_size):
+    def __init__(self, samples, tokenizer, block_size):
+        # Format each sample as:
+        # System: {system_prompt}
+        # User: {user}
+        # Assistant: {output}
+        # The system prompt carries the reasoning toggle signal
         self.examples   = []
         self.block_size = block_size
 
-        for trace in traces:
-            tokens = tokenizer.encode(trace["sft_text"])
+        for sample in samples:
+            text = (
+                f"System: {sample['system_prompt']}\n"
+                f"User: {sample['user']}\n"
+                f"Assistant: {sample['output']}"
+            )
+
+            tokens = tokenizer.encode(text)
 
             if len(tokens) < block_size:
                 tokens = tokens + [0] * (block_size - len(tokens))
@@ -343,6 +399,9 @@ class GPT(nn.Module):
 # ─── Stage 1 — Pretraining ────────────────────────────────────────────────────
 
 def pretrain(model, data, device):
+    # Train on Sherlock + Darwin — general language and reasoning patterns
+    # before SFT the model has no instruction following capability
+    # pretraining gives it the language foundation to build on
     print("\n" + "=" * 60)
     print("Stage 1 — Pretraining on Sherlock + Darwin")
     print("=" * 60)
@@ -378,20 +437,24 @@ def pretrain(model, data, device):
     print("Pretraining complete\n")
 
 
-# ─── Stage 2 — SFT on Reasoning Traces ───────────────────────────────────────
+# ─── Stage 2 — SFT on Nemotron Chat ──────────────────────────────────────────
 
-def sft_train(model, traces, device):
-    # Fine tune on CommonsenseQA reasoning traces
-    # teaches the model the <think>...</think> + Answer: X format
-    # the model learns to produce reasoning before committing to an answer
+def sft_train(model, sft_samples, device):
+    # Fine tune on Nemotron chat data — teaches two things:
+    # 1. The <think>...</think> format for reasoning traces
+    # 2. Controllable reasoning — respond to "detailed thinking on/off"
+    #    in the system prompt to toggle reasoning mode
+    #
+    # Samples are interleaved on/off so the model sees both modes equally
+    # curriculum: easier off samples come before harder on samples in each pair
     print("\n" + "=" * 60)
-    print("Stage 2 — SFT on CommonsenseQA reasoning traces")
+    print("Stage 2 — SFT on Nemotron chat (controllable reasoning)")
     print("=" * 60)
 
-    dataset   = SFTDataset(traces, tokenizer, block_size)
-    loader    = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+    dataset   = SFTDataset(sft_samples, tokenizer, block_size)
+    loader    = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False)  # keep curriculum order
 
-    # Freeze embeddings — preserve pretraining representations
+    # Freeze embeddings — preserve pretraining token representations
     for param in model.token_embedding.parameters():
         param.requires_grad = False
     for param in model.position_embedding.parameters():
@@ -435,31 +498,22 @@ def sft_train(model, traces, device):
     print("SFT complete\n")
 
 
-# ─── Stage 3 — GRPO ───────────────────────────────────────────────────────────
+# ─── Stage 3 — GRPO on Nemotron Math ─────────────────────────────────────────
 
-def extract_answer(text):
-    # Extract the answer letter (A-E) from the model's generated text
-    # looks for "Answer: X" pattern produced by the SFT format
-    # falls back to searching for any standalone A-E letter
-    match = re.search(r"Answer:\s*([A-E])", text, re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-
-    # fallback — look for any lone answer letter near the end
-    match = re.search(r"\b([A-E])\b", text[-50:], re.IGNORECASE)
-    if match:
-        return match.group(1).upper()
-
-    return None
+def extract_boxed_answer(text):
+    # Extract the answer from LaTeX \boxed{} notation
+    # standard format for math answers in the Nemotron dataset
+    # handles nested braces e.g. \boxed{\frac{1}{2}}
+    match = re.search(r"\\boxed\{([^}]*(?:\{[^}]*\}[^}]*)*)\}", text)
+    return match.group(1).strip() if match else None
 
 
 def generate_response(model, prompt, max_new_tokens=150, temperature=0.8):
-    # Sample a response from the model — used during GRPO to generate
-    # the group of G responses per question
+    # Sample a response for GRPO — temperature > 0 ensures diversity
+    # across the G responses sampled per question
     model.eval()
     tokens = tokenizer.encode(prompt)
 
-    # Truncate prompt if needed to leave room for the response
     if len(tokens) > block_size - max_new_tokens:
         tokens = tokens[-(block_size - max_new_tokens):]
 
@@ -477,16 +531,15 @@ def generate_response(model, prompt, max_new_tokens=150, temperature=0.8):
     return tokenizer.decode(x[0].tolist())
 
 
-def compute_log_probs_for_response(model, prompt_tokens, response_tokens):
-    # Compute log probability of a response sequence given the prompt
-    # used to compute the GRPO policy gradient
+def compute_response_log_prob(model, prompt_tokens, response_tokens):
+    # Compute the total log probability of the response tokens given the prompt
+    # used to compute the GRPO policy gradient update
     all_tokens = torch.tensor(
         prompt_tokens + response_tokens,
         dtype=torch.long,
         device=device
     ).unsqueeze(0)
 
-    # Truncate to block_size
     if all_tokens.shape[1] > block_size:
         all_tokens = all_tokens[:, -block_size:]
 
@@ -494,67 +547,64 @@ def compute_log_probs_for_response(model, prompt_tokens, response_tokens):
     logits    = model(all_tokens)
     log_probs = F.log_softmax(logits, dim=-1)
 
-    # Only gather log probs over the response portion
     prompt_len   = min(len(prompt_tokens), block_size - len(response_tokens))
     response_len = min(len(response_tokens), block_size - prompt_len)
 
     if response_len <= 0:
         return torch.tensor(0.0, device=device, requires_grad=True)
 
-    # Gather log probs for each response token
-    target_tokens = all_tokens[:, prompt_len:prompt_len + response_len]
+    target_tokens      = all_tokens[:, prompt_len:prompt_len + response_len]
     response_log_probs = log_probs[:, prompt_len - 1:prompt_len + response_len - 1, :]
-    token_log_probs = response_log_probs.gather(
-        2, target_tokens.unsqueeze(-1)
-    ).squeeze(-1)
+    token_log_probs    = response_log_probs.gather(2, target_tokens.unsqueeze(-1)).squeeze(-1)
 
     return token_log_probs.sum()
 
 
-def grpo_train(model, traces, device):
+def grpo_train(model, grpo_samples, device):
     # GRPO — Group Relative Policy Optimization
     # Used by DeepSeek R1 to train reasoning without a separate reward model
     #
-    # For each question:
-    #   1. Sample G responses from the current policy
-    #   2. Score each response: +1 if correct answer, 0 if wrong
-    #   3. Normalize scores within the group (subtract mean, divide by std)
-    #      This is the "relative" in GRPO — rewards are relative to the group,
-    #      not absolute. This stabilizes training and removes the need for a
-    #      separate value/critic model (unlike PPO which needs one).
-    #   4. Update the policy to increase probability of high-reward responses
+    # For each math question:
+    #   1. Sample G=4 responses from the current policy
+    #   2. Score each: +1 if \boxed{} answer matches ground truth, 0 if wrong
+    #   3. Normalize rewards within the group (subtract mean, divide by std)
+    #      relative scoring removes the need for a value/critic model (unlike PPO)
+    #      if all responses are correct or all wrong — no update (no signal)
+    #   4. Policy gradient: increase log prob of high-reward responses
+    #
+    # Why math for GRPO and not chat:
+    #   Chat responses have no ground truth — you can't verify if they're correct
+    #   Math answers are objectively right or wrong — perfect binary reward signal
+    #   Format reward alone (rewarding <think> tags) doesn't verify reasoning quality
     #
     # Alternatives:
-    #   PPO    — needs a separate critic model, more stable but more complex
-    #   REINFORCE — simpler than both but high variance, no relative scoring
-    #   DPO    — needs pre-existing chosen/rejected pairs, no online sampling
-    #
-    # GRPO sits in the sweet spot: online sampling (like PPO/REINFORCE) but
-    # with relative reward normalization that removes the need for a critic.
+    #   PPO       — needs a separate critic/value model, more stable but more complex
+    #   REINFORCE — simpler but high variance, no relative reward normalization
+    #   DPO       — needs pre-existing chosen/rejected pairs, no online sampling
 
     print("\n" + "=" * 60)
-    print("Stage 3 — GRPO on CommonsenseQA")
+    print("Stage 3 — GRPO on Nemotron math")
     print("=" * 60)
-    print(f"Group size (G): {GRPO_GROUPS}")
-    print(f"Reward: +1 correct answer, 0 wrong\n")
+    print(f"Group size G: {GRPO_GROUPS}")
+    print(f"Reward: +1 correct \\boxed{{}} answer, 0 wrong\n")
 
-    optimizer = optim.AdamW(model.parameters(), lr=5e-6)  # very low lr for RL
-
+    optimizer     = optim.AdamW(model.parameters(), lr=5e-6)
     step          = 0
     total_correct = 0
     total_seen    = 0
 
     while step < grpo_max_steps:
-        # Sample a random question from the traces
-        trace = random.choice(traces)
+        sample         = random.choice(grpo_samples)
+        correct_answer = sample["answer"]
 
+        # Build prompt with "detailed thinking on" system prompt
+        # GRPO always uses reasoning on — we want the model to think before answering
         prompt = (
-            f"Question: {trace['question']}\n"
-            f"Choices: {trace['choices']}\n"
-            f"<think>\n"
+            f"System: {THINKING_ON}\n"
+            f"User: {sample['user']}\n"
+            f"Assistant: <think>\n"
         )
-        correct_answer = trace["answer"]
-        prompt_tokens  = tokenizer.encode(prompt)
+        prompt_tokens = tokenizer.encode(prompt)
 
         # ── Step 1: Sample G responses ────────────────────────────────────────
         responses = []
@@ -562,10 +612,9 @@ def grpo_train(model, traces, device):
 
         for _ in range(GRPO_GROUPS):
             response_text   = generate_response(model, prompt)
-            # Extract only the generated portion
             generated       = response_text[len(prompt):]
-            predicted       = extract_answer(generated)
-            reward          = 1.0 if predicted == correct_answer else 0.0
+            predicted       = extract_boxed_answer(generated)
+            reward          = 1.0 if (predicted is not None and predicted == correct_answer) else 0.0
 
             responses.append(generated)
             rewards.append(reward)
@@ -573,20 +622,15 @@ def grpo_train(model, traces, device):
         # ── Step 2: Normalize rewards within the group ────────────────────────
         rewards_tensor = torch.tensor(rewards, dtype=torch.float32)
 
-        if rewards_tensor.std() > 1e-8:
-            # Subtract mean and divide by std — relative scoring
-            # if all responses are correct or all wrong, std ≈ 0
-            # skip the update in that case — no signal to learn from
-            normalized_rewards = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
-        else:
-            # All responses gave the same reward — no relative signal
-            # skip this question
+        if rewards_tensor.std() < 1e-8:
+            # All responses gave the same reward — no relative signal to learn from
+            # skip this question rather than making a noisy update
             step += 1
             continue
 
+        normalized_rewards = (rewards_tensor - rewards_tensor.mean()) / (rewards_tensor.std() + 1e-8)
+
         # ── Step 3: Policy gradient update ───────────────────────────────────
-        # Maximize expected reward — increase log prob of high-reward responses
-        # decrease log prob of low-reward responses
         loss = torch.tensor(0.0, device=device, requires_grad=True)
 
         for response, norm_reward in zip(responses, normalized_rewards.tolist()):
@@ -594,11 +638,10 @@ def grpo_train(model, traces, device):
             if not response_tokens:
                 continue
 
-            log_prob  = compute_log_probs_for_response(model, prompt_tokens, response_tokens)
-            # GRPO loss: negative because we want to maximize reward
-            # multiply log prob by normalized reward
-            # high positive reward → increase log prob of this response
-            # high negative reward → decrease log prob of this response
+            log_prob = compute_response_log_prob(model, prompt_tokens, response_tokens)
+            # Negative because optimizer minimizes — we want to maximize reward
+            # high positive norm_reward → increase log prob of this response
+            # high negative norm_reward → decrease log prob of this response
             loss = loss + (-log_prob * norm_reward)
 
         loss = loss / GRPO_GROUPS
@@ -608,7 +651,6 @@ def grpo_train(model, traces, device):
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()
 
-        # Track accuracy
         total_correct += sum(rewards)
         total_seen    += GRPO_GROUPS
 
@@ -627,8 +669,6 @@ def grpo_train(model, traces, device):
 # ─── Generation ───────────────────────────────────────────────────────────────
 
 def generate(model, prompt, max_new_tokens=200, temperature=0.7):
-    # Lower temperature than pretraining — reasoning benefits from
-    # more deterministic output
     model.eval()
     tokens = tokenizer.encode(prompt)
     x      = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
@@ -655,14 +695,16 @@ if __name__ == "__main__":
     print("Stage 0 — Data Preparation")
     print("=" * 60)
 
-    # Pretraining corpus
+    # Pretraining corpus — Sherlock + Darwin
     text = download_corpus()
     data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
     print(f"Pretraining tokens: {len(data):,}")
 
-    # CommonsenseQA traces — generated once then cached
-    traces = generate_traces(NUM_SAMPLES)
-    print(f"SFT/GRPO examples: {len(traces)}")
+    # Nemotron SFT data — chat, reasoning on/off balanced
+    sft_samples = load_sft_data(NUM_SFT_SAMPLES)
+
+    # Nemotron GRPO data — math, reasoning on only
+    grpo_samples = load_grpo_data(NUM_GRPO_SAMPLES)
 
     # ── Build model ───────────────────────────────────────────────────────────
     model = GPT(
@@ -680,42 +722,44 @@ if __name__ == "__main__":
     # ── Stage 1 — Pretrain ────────────────────────────────────────────────────
     pretrain(model, data, device)
 
-    # Test after pretraining
-    print("After pretraining:")
-    print(generate(model, "Holmes looked at the evidence and concluded"))
-    print()
+    # ── Stage 2 — SFT on Nemotron chat ───────────────────────────────────────
+    sft_train(model, sft_samples, device)
 
-    # ── Stage 2 — SFT on reasoning traces ────────────────────────────────────
-    sft_train(model, traces, device)
-
-    # Test after SFT — should start producing <think> format
-    test_q  = traces[0]
-    prompt  = (
-        f"Question: {test_q['question']}\n"
-        f"Choices: {test_q['choices']}\n"
-        f"<think>\n"
+    # Test controllable reasoning after SFT
+    print("After SFT — reasoning ON:")
+    prompt_on = (
+        f"System: {THINKING_ON}\n"
+        f"User: What is the capital of France?\n"
+        f"Assistant:"
     )
-    print("After SFT:")
-    print(generate(model, prompt))
+    print(generate(model, prompt_on))
+
+    print("\nAfter SFT — reasoning OFF:")
+    prompt_off = (
+        f"System: {THINKING_OFF}\n"
+        f"User: What is the capital of France?\n"
+        f"Assistant:"
+    )
+    print(generate(model, prompt_off))
     print()
 
-    # ── Stage 3 — GRPO ────────────────────────────────────────────────────────
-    grpo_train(model, traces, device)
+    # ── Stage 3 — GRPO on Nemotron math ──────────────────────────────────────
+    grpo_train(model, grpo_samples, device)
 
-    # Test after GRPO — should show improved answer accuracy
-    print("After GRPO:")
-    for trace in traces[:3]:
+    # Test after GRPO — should show improved math reasoning
+    print("After GRPO — math reasoning:")
+    for sample in grpo_samples[:3]:
         prompt = (
-            f"Question: {trace['question']}\n"
-            f"Choices: {trace['choices']}\n"
-            f"<think>\n"
+            f"System: {THINKING_ON}\n"
+            f"User: {sample['user'][:200]}\n"
+            f"Assistant: <think>\n"
         )
         response  = generate(model, prompt)
-        predicted = extract_answer(response)
-        correct   = trace["answer"]
+        predicted = extract_boxed_answer(response)
+        correct   = sample["answer"]
         status    = "✓" if predicted == correct else "✗"
         print(f"  {status} Predicted: {predicted} | Correct: {correct}")
-        print(f"  Q: {trace['question'][:60]}...")
+        print(f"  Q: {sample['user'][:80]}...")
         print()
 
     # ── Save ──────────────────────────────────────────────────────────────────
