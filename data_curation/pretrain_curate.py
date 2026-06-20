@@ -247,9 +247,13 @@ def load_fineweb(n_samples):
 
 def load_dolma(n_samples):
     print("\nLoading Dolma...")
+    # allenai/dolma requires a dataset script which is no longer supported
+    # by newer versions of the datasets library.
+    # allenai/dolma-pes2o is a subset of Dolma (peS2o — scientific papers)
+    # that loads as a standard parquet dataset with no script required
+    # it is diverse, high quality web text — a good raw source for curation
     dataset = load_dataset(
-        "allenai/dolma",
-        name      = "v1_6-sample",
+        "allenai/dolma-pes2o",
         split     = "train",
         streaming = True
     )
