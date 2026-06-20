@@ -1,3 +1,4 @@
+import copy
 import json
 import torch
 import torch.nn as nn
@@ -6,19 +7,64 @@ import tiktoken
 from torch.utils.data import Dataset, DataLoader
 
 
+# ─── Hardware Config ──────────────────────────────────────────────────────────
+
+device = torch.device(
+    "mps"  if torch.backends.mps.is_available() else
+    "cuda" if torch.cuda.is_available()         else
+    "cpu"
+)
+
+print(f"Using device: {device}")
+
+# ── Default — tiny_corpus.txt + sft_dataset.jsonl + dpo_dataset.jsonl ──
+# Sized to match the tiny corpus (~700 words, 20 SFT examples, 15 DPO examples)
+# A larger model would immediately overfit this data
+# Swap to the curated presets below when using fineweb/dolma corpora
+embed_dim  = 32
+num_heads  = 4
+hidden_dim = 128
+num_layers = 2
+block_size = 32
+
+# ── Curated corpus (fineweb_corpus.txt + fineweb_sft.jsonl + fineweb_dpo.jsonl) ──
+# Use these when swapping to a larger curated corpus from data_curation/
+# ── Laptop / M4 Max ──
+# embed_dim  = 256
+# num_heads  = 8
+# hidden_dim = 1024
+# num_layers = 8
+# block_size = 128
+
+# ── Cloud GPU (A100/H100) ──
+# embed_dim    = 512
+# num_heads    = 16
+# hidden_dim   = 2048
+# num_layers   = 12
+# block_size   = 256
+# USE_COMPILE  = True    # torch.compile — significant speedup on CUDA
+# USE_AMP      = True    # automatic mixed precision — CUDA only, not MPS
+
+# ── CPU / Small GPU ──
+# embed_dim  = 128
+# num_heads  = 4
+# hidden_dim = 512
+# num_layers = 4
+# block_size = 64
+
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 
+# Swap these paths when using curated corpora from data_curation/
+# e.g. CORPUS_PATH   = "../data/fineweb_corpus.txt"
+#      SFT_DATA_PATH = "../data/fineweb_sft.jsonl"
+#      DPO_DATA_PATH = "../data/fineweb_dpo.jsonl"
 CORPUS_PATH   = "../data/tiny_corpus.txt"
 SFT_DATA_PATH = "../data/sft_dataset.jsonl"
 DPO_DATA_PATH = "../data/dpo_dataset.jsonl"
 MODEL_SAVE    = "../data/dpo_model.pt"
 
-block_size    = 32
-embed_dim     = 32
-num_heads     = 4
-hidden_dim    = 128
-num_layers    = 2
-batch_size    = 4
+batch_size    = 4   # small — SFT and DPO datasets are tiny
 
 
 # ─── Tokenizer ────────────────────────────────────────────────────────────────
@@ -212,7 +258,7 @@ def pretrain(model, device):
     # the model learns token distributions, grammar, and world knowledge
     # from the corpus before any instruction tuning
     print("=" * 60)
-    print("Stage 1 — Pretraining on tiny_corpus.txt")
+    print("Stage 1 — Pretraining on corpus")
     print("=" * 60)
 
     dataset    = PretrainDataset(CORPUS_PATH, tokenizer, block_size)
@@ -254,7 +300,7 @@ def sft_train(model, device):
     # already present from pretraining
     # fine tuning a model with no pretraining signal produces poor results
     print("=" * 60)
-    print("Stage 2 — SFT on sft_dataset.jsonl")
+    print("Stage 2 — SFT on sft dataset")
     print("=" * 60)
 
     dataset   = SFTDataset(SFT_DATA_PATH, tokenizer, block_size)
@@ -321,7 +367,6 @@ def compute_log_probs(model, tokens):
     log_probs = F.log_softmax(logits, dim=-1)
 
     # Gather the log prob of each actual token
-    # shape: (batch, seq_len)
     token_log_probs = log_probs.gather(
         2, y.unsqueeze(-1)
     ).squeeze(-1)
@@ -343,11 +388,9 @@ def dpo_loss(model, ref_model, chosen, rejected, beta=0.1):
     # it acts as a baseline — DPO pushes the policy model toward chosen
     # while the KL term prevents it from drifting too far from the reference
 
-    # Policy model log probs
     chosen_log_probs   = compute_log_probs(model, chosen)
     rejected_log_probs = compute_log_probs(model, rejected)
 
-    # Reference model log probs — no gradients needed
     with torch.no_grad():
         ref_chosen_log_probs   = compute_log_probs(ref_model, chosen)
         ref_rejected_log_probs = compute_log_probs(ref_model, rejected)
@@ -369,7 +412,7 @@ def dpo_train(model, ref_model, device):
     # DPO directly optimizes the model to prefer chosen over rejected responses
     # no reward model needed — the preference signal comes from the dataset
     print("=" * 60)
-    print("Stage 3 — DPO on dpo_dataset.jsonl")
+    print("Stage 3 — DPO on dpo dataset")
     print("=" * 60)
 
     dataset   = DPODataset(DPO_DATA_PATH, tokenizer, block_size)
@@ -408,7 +451,6 @@ def dpo_train(model, ref_model, device):
 
 def generate(model, prompt, max_new_tokens=100):
     model.eval()
-    device = next(model.parameters()).device
     tokens = tokenizer.encode(prompt)
     x      = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
 
@@ -428,7 +470,6 @@ def generate(model, prompt, max_new_tokens=100):
 
 if __name__ == "__main__":
     torch.manual_seed(123)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Build model
     model = MiniGPT(
@@ -443,7 +484,6 @@ if __name__ == "__main__":
     # ── Stage 1 — Pretrain ────────────────────────────────────────────────────
     pretrain(model, device)
 
-    # Test after pretraining — raw completion, no instruction following
     print("After pretraining:")
     print(generate(model, "The lighthouse had been dark"))
     print()
@@ -451,7 +491,6 @@ if __name__ == "__main__":
     # ── Stage 2 — SFT ─────────────────────────────────────────────────────────
     sft_train(model, device)
 
-    # Test after SFT — should follow the instruction format
     print("After SFT:")
     print(generate(model, "### Instruction:\nWho is Maria?\n\n### Response:\n"))
     print()
@@ -460,14 +499,12 @@ if __name__ == "__main__":
 
     # Create a frozen copy of the SFT model to use as the reference
     # the reference model captures the SFT distribution before DPO nudges it
-    import copy
     ref_model = copy.deepcopy(model).to(device)
     for param in ref_model.parameters():
         param.requires_grad = False
 
     dpo_train(model, ref_model, device)
 
-    # Test after DPO — should prefer accurate responses over vague ones
     print("After DPO:")
     print(generate(model, "### Prompt:\nWhy did Maria move to the island?\n\n### Response:\n"))
     print()

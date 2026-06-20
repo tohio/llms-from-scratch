@@ -6,20 +6,64 @@ import tiktoken
 from torch.utils.data import Dataset, DataLoader
 
 
+# ─── Hardware Config ──────────────────────────────────────────────────────────
+
+device = torch.device(
+    "mps"  if torch.backends.mps.is_available() else
+    "cuda" if torch.cuda.is_available()         else
+    "cpu"
+)
+
+print(f"Using device: {device}")
+
+# ── Default — tiny_corpus.txt + sft_dataset.jsonl ──
+# Sized to match the tiny corpus (~700 words, 20 SFT examples)
+# A larger model would immediately overfit this data
+# Swap to the curated presets below when using fineweb/dolma corpora
+embed_dim  = 32
+num_heads  = 4
+hidden_dim = 128
+num_layers = 2
+block_size = 32
+
+# ── Curated corpus (fineweb_corpus.txt + fineweb_sft.jsonl) ──
+# Use these when swapping to a larger curated corpus from data_curation/
+# ── Laptop / M4 Max ──
+# embed_dim  = 256
+# num_heads  = 8
+# hidden_dim = 1024
+# num_layers = 8
+# block_size = 128
+
+# ── Cloud GPU (A100/H100) ──
+# embed_dim    = 512
+# num_heads    = 16
+# hidden_dim   = 2048
+# num_layers   = 12
+# block_size   = 256
+# USE_COMPILE  = True    # torch.compile — significant speedup on CUDA
+# USE_AMP      = True    # automatic mixed precision — CUDA only, not MPS
+
+# ── CPU / Small GPU ──
+# embed_dim  = 128
+# num_heads  = 4
+# hidden_dim = 512
+# num_layers = 4
+# block_size = 64
+
+
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-SFT_DATA_PATH  = "../data/sft_dataset.jsonl"
-CORPUS_PATH    = "../data/tiny_corpus.txt"
-MODEL_SAVE     = "../data/sft_model.pt"
+# Swap these paths when using curated corpora from data_curation/
+# e.g. CORPUS_PATH = "../data/fineweb_corpus.txt"
+#      SFT_DATA_PATH = "../data/fineweb_sft.jsonl"
+CORPUS_PATH   = "../data/tiny_corpus.txt"
+SFT_DATA_PATH = "../data/sft_dataset.jsonl"
+MODEL_SAVE    = "../data/sft_model.pt"
 
-block_size     = 32    # larger than pretraining to handle instruction + response
-embed_dim      = 32
-num_heads      = 4
-hidden_dim     = 128
-num_layers     = 2
-batch_size     = 4     # small — SFT dataset is tiny
-max_steps      = 1000  # SFT needs fewer steps than pretraining
-learning_rate  = 1e-4  # lower than pretraining — fine tuning not retraining
+batch_size    = 4      # small — SFT dataset is tiny
+max_steps     = 1000   # SFT needs fewer steps than pretraining
+learning_rate = 1e-4   # lower than pretraining — fine tuning not retraining
 
 
 # ─── Tokenizer ────────────────────────────────────────────────────────────────
@@ -46,7 +90,6 @@ class SFTDataset(Dataset):
                     f"### Response:\n{example['response']}"
                 )
 
-                # Tokenize the full text
                 tokens = tokenizer.encode(text)
 
                 # Pad or truncate to block_size
@@ -144,26 +187,24 @@ class MiniGPT(nn.Module):
         return self.lm_head(x)
 
 
-# ─── Pretrain on Tiny Corpus ──────────────────────────────────────────────────
+# ─── Pretrain on Corpus ───────────────────────────────────────────────────────
 
 def pretrain(model, device):
-    # Pretrain on tiny_corpus.txt first so the model has signal
-    # before SFT — fine tuning a model with no pretraining signal
-    # produces poor results regardless of SFT data quality
-    print("Pretraining on tiny_corpus.txt...")
+    # Pretrain on corpus first so the model has signal before SFT
+    # fine tuning a model with no pretraining signal produces poor results
+    # regardless of SFT data quality — the signal must already be latent
+    print("Pretraining on corpus...")
 
     with open(CORPUS_PATH, "r", encoding="utf8") as f:
         text = f.read()
 
-    data      = tokenizer.encode(text)
-    data      = torch.tensor(data, dtype=torch.long)
+    data      = torch.tensor(tokenizer.encode(text), dtype=torch.long)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 
     model.train()
     step = 0
 
     while step < 5000:
-        # random batch from corpus
         indices = torch.randint(0, len(data) - block_size, (batch_size,))
         x       = torch.stack([data[i:i + block_size] for i in indices]).to(device)
         y       = torch.stack([data[i + 1:i + block_size + 1] for i in indices]).to(device)
@@ -191,7 +232,7 @@ def sft_train(model, dataloader, device):
     # lower learning rate than pretraining — we want to nudge not overwrite
     print("Starting SFT...")
 
-    # freeze the embedding layers — preserve the token representations
+    # Freeze the embedding layers — preserve the token representations
     # learned during pretraining, only update the transformer blocks
     for param in model.token_embedding.parameters():
         param.requires_grad = False
@@ -228,7 +269,7 @@ def sft_train(model, dataloader, device):
             optimizer.step()
 
             if step % 100 == 0:
-                print(f"SFT step {step}, Loss: {loss.item():.4f}")
+                print(f"  SFT step {step}, Loss: {loss.item():.4f}")
 
             step += 1
 
@@ -239,7 +280,6 @@ def sft_train(model, dataloader, device):
 
 def generate(model, prompt, max_new_tokens=100):
     model.eval()
-    device = next(model.parameters()).device
     tokens = tokenizer.encode(prompt)
     x      = torch.tensor(tokens, dtype=torch.long, device=device).unsqueeze(0)
 
@@ -259,7 +299,6 @@ def generate(model, prompt, max_new_tokens=100):
 
 if __name__ == "__main__":
     torch.manual_seed(123)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Build model
     model = MiniGPT(
@@ -271,7 +310,7 @@ if __name__ == "__main__":
         num_layers  = num_layers
     ).to(device)
 
-    # Step 1 — pretrain on tiny corpus
+    # Step 1 — pretrain on corpus
     pretrain(model, device)
 
     # Step 2 — fine tune on SFT dataset
@@ -285,7 +324,7 @@ if __name__ == "__main__":
     torch.save(model.state_dict(), MODEL_SAVE)
     print(f"Model saved to {MODEL_SAVE}")
 
-    # Step 4 — test with an instruction prompt
+    # Step 4 — test with instruction prompts
     prompt = "### Instruction:\nWho is Maria?\n\n### Response:\n"
     print(f"\nPrompt: {prompt}")
     print(f"Response: {generate(model, prompt)}")

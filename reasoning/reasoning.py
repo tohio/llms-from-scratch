@@ -1,19 +1,20 @@
+import random
+import re
+import os
+import urllib.request
+from collections import Counter
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import tiktoken
-import urllib.request
-import os
-import re
-import copy
-from collections import Counter
 from torch.utils.data import Dataset, DataLoader
 
 
 # ─── Hardware Config ──────────────────────────────────────────────────────────
 
 # Device detection — automatically picks the best available
-device = (
+device = torch.device(
     "mps"  if torch.backends.mps.is_available() else
     "cuda" if torch.cuda.is_available()         else
     "cpu"
@@ -375,7 +376,6 @@ def react(model):
         # in production this calls a real search engine, database, or API
         # the tool result becomes the next observation in the reasoning loop
         # observations drawn from both corpora — deductive and inductive reasoning
-        import random
         observations = [
             "The footprints suggest a man of medium height who walks with a slight limp.",
             "The letter was written hastily — the ink is smudged on the right side.",

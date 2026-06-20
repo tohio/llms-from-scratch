@@ -1,10 +1,10 @@
+import os
 import re
+import random
 import hashlib
 import urllib.request
 from datasets import load_dataset
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-import fasttext
+from langdetect import detect, LangDetectException
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -24,99 +24,74 @@ MIN_LENGTH       = 100    # minimum character length
 MAX_LENGTH       = 10000  # maximum character length
 MIN_WORDS        = 20     # minimum word count
 MAX_WORD_RATIO   = 0.5    # maximum ratio of long words (filters garbled text)
-MAX_PERPLEXITY   = 1000   # documents above this perplexity are low quality
 LANG_THRESHOLD   = 0.8    # minimum confidence for language detection
+
+# Quality scoring thresholds — heuristic based
+# these catch low-quality documents without loading a model
+# alternative: perplexity scoring using a small model (e.g. GPT-2) is more
+# accurate but requires loading a model and is significantly slower
+MAX_DIGIT_RATIO  = 0.2    # documents with >20% digits are likely tables/code
+MAX_UPPER_RATIO  = 0.3    # documents with >30% uppercase are likely spam/ads
+MAX_SYMBOL_RATIO = 0.1    # documents with >10% symbols are likely garbled
+MIN_PUNCT_RATIO  = 0.01   # documents with <1% punctuation lack sentence structure
 
 # Dataset mixing ratios — must sum to 1.0
 # adjust these to control the proportion of each source in the final corpus
 # production models like LLaMA and Falcon use carefully tuned mixing ratios
-MIXING_RATIOS    = {
+MIXING_RATIOS = {
     "fineweb": 0.6,   # 60% FineWeb-Edu — high quality educational content
     "dolma":   0.4    # 40% Dolma — diverse web text
 }
 
-# FastText language model path
-FASTTEXT_MODEL_PATH = "lid.176.ftz"
-FASTTEXT_MODEL_URL  = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.ftz"
-
-# Perplexity model — GPT-2 is small enough to run locally on CPU
-# alternative: use heuristic scoring (punctuation density, digit ratio,
-# uppercase ratio, symbol ratio) if you want to avoid loading a model entirely
-# heuristic is faster but less accurate than perplexity based filtering
-PERPLEXITY_MODEL = "gpt2"
-
 
 # ─── Language Detection ───────────────────────────────────────────────────────
+# langdetect — pure Python, no NumPy dependency, no model download needed
+# slightly slower than fasttext but accurate enough for web text filtering
+# and avoids the NumPy 2.x incompatibility that breaks fasttext
 
-def load_fasttext_model():
-    # Download the fasttext language identification model if not present
-    # lid.176.ftz is a compressed model that identifies 176 languages
-    # only 900KB — runs fully locally, no GPU needed
-    import os
-    if not os.path.exists(FASTTEXT_MODEL_PATH):
-        print(f"Downloading fasttext model...")
-        urllib.request.urlretrieve(FASTTEXT_MODEL_URL, FASTTEXT_MODEL_PATH)
-    return fasttext.load_model(FASTTEXT_MODEL_PATH)
-
-
-def is_english(text, model, threshold=LANG_THRESHOLD):
-    # Predict language — fasttext returns label and confidence score
-    # replace newlines since fasttext treats them as document separators
-    label, score = model.predict(text.replace("\n", " "))
-    return label[0] == "__label__en" and score[0] >= threshold
+def is_english(text):
+    try:
+        return detect(text) == "en"
+    except LangDetectException:
+        # langdetect raises LangDetectException on very short or garbled text
+        # treat as non-English to skip
+        return False
 
 
-def filter_language(samples, model):
+def filter_language(samples):
     print("\nFiltering by language...")
-    english = [s for s in samples if is_english(s, model)]
+    english = [s for s in samples if is_english(s)]
     print(f"Kept {len(english)} / {len(samples)} English samples")
     return english
 
 
-# ─── Perplexity Scoring ───────────────────────────────────────────────────────
+# ─── Quality Scoring ──────────────────────────────────────────────────────────
+# Heuristic quality scoring — measures surface properties of text that
+# correlate with quality without requiring a model
+# catches spam, tables, code dumps, and garbled text
+# alternative: perplexity scoring using GPT-2 via transformers is more
+# principled but requires a model load and is ~100x slower per document
 
-def load_perplexity_model():
-    # GPT-2 is used as the scoring model — small enough to run on CPU
-    # alternative: replace with a heuristic scorer that measures punctuation
-    # density, digit ratio, uppercase ratio, and symbol ratio — much faster
-    # but less accurate than perplexity based filtering
-    print("\nLoading perplexity model (GPT-2)...")
-    device    = "cuda" if torch.cuda.is_available() else "cpu"
-    tokenizer = AutoTokenizer.from_pretrained(PERPLEXITY_MODEL)
-    model     = AutoModelForCausalLM.from_pretrained(PERPLEXITY_MODEL).to(device)
-    model.eval()
-    return tokenizer, model, device
+def quality_score(text):
+    # Count character types as ratios of total length
+    chars      = len(text)
+    digits     = sum(c.isdigit()  for c in text) / chars
+    upper      = sum(c.isupper()  for c in text) / chars
+    symbols    = sum(not c.isalnum() and not c.isspace() for c in text) / chars
+    punct      = sum(c in ".!?," for c in text) / chars
 
-
-def compute_perplexity(text, tokenizer, model, device):
-    # Perplexity measures how surprised the model is by the text
-    # low perplexity = natural, coherent text the model finds predictable
-    # high perplexity = garbled, unnatural, or out-of-distribution text
-    inputs = tokenizer(
-        text[:512],              # truncate to 512 tokens for speed
-        return_tensors  = "pt",
-        truncation      = True,
-        max_length      = 512
-    ).to(device)
-
-    with torch.no_grad():
-        outputs = model(**inputs, labels=inputs["input_ids"])
-        # cross entropy loss — exponentiate to get perplexity
-        perplexity = torch.exp(outputs.loss).item()
-
-    return perplexity
+    # All ratios must be within bounds — any failure disqualifies the document
+    if digits  > MAX_DIGIT_RATIO:  return False
+    if upper   > MAX_UPPER_RATIO:  return False
+    if symbols > MAX_SYMBOL_RATIO: return False
+    if punct   < MIN_PUNCT_RATIO:  return False
+    return True
 
 
-def filter_perplexity(samples, tokenizer, model, device):
-    print("\nFiltering by perplexity...")
-    filtered = []
-
-    for text in samples:
-        ppl = compute_perplexity(text, tokenizer, model, device)
-        if ppl <= MAX_PERPLEXITY:
-            filtered.append(text)
-
-    print(f"Kept {len(filtered)} / {len(samples)} samples after perplexity filter")
+def filter_quality(samples):
+    print("\nFiltering by quality...")
+    filtered = [s for s in samples if quality_score(s)]
+    print(f"Kept {len(filtered)} / {len(samples)} samples after quality filter")
     return filtered
 
 
@@ -233,20 +208,14 @@ def mix_datasets(datasets):
     # frontier labs treat their mixing ratios as trade secrets
     print("\nMixing datasets...")
 
-    # find the total target size based on the smallest proportional dataset
-    sizes      = {name: len(samples) for name, samples in datasets.items()}
-    min_ratio  = min(MIXING_RATIOS.values())
-    min_size   = min(sizes[name] / MIXING_RATIOS[name] for name in datasets)
+    min_size = min(len(samples) / MIXING_RATIOS[name] for name, samples in datasets.items())
 
     mixed = []
     for name, samples in datasets.items():
-        # take the proportion of each dataset as specified in MIXING_RATIOS
         n = int(min_size * MIXING_RATIOS[name])
         mixed.extend(samples[:n])
         print(f"  {name}: {n} samples ({MIXING_RATIOS[name]*100:.0f}%)")
 
-    # shuffle to interleave sources
-    import random
     random.shuffle(mixed)
 
     print(f"Total mixed samples: {len(mixed)}")
@@ -307,17 +276,13 @@ def save(samples, path):
 
 if __name__ == "__main__":
 
-    # Load shared models once — reused across both datasets
-    lang_model                        = load_fasttext_model()
-    ppl_tokenizer, ppl_model, device  = load_perplexity_model()
-
     # ── FineWeb-Edu — already curated, light touch pipeline ──────────────────
     print("\n" + "=" * 60)
     print("FineWeb-Edu — clean curated source")
     print("=" * 60)
 
     fineweb_samples = load_fineweb(FINEWEB_SAMPLES)
-    fineweb_samples = filter_language(fineweb_samples, lang_model)
+    fineweb_samples = filter_language(fineweb_samples)
     fineweb_samples = deduplicate_exact(fineweb_samples)
     fineweb_samples = clean_samples(fineweb_samples)
     save(fineweb_samples, FINEWEB_OUTPUT)
@@ -333,9 +298,9 @@ if __name__ == "__main__":
     print("=" * 60)
 
     dolma_samples = load_dolma(DOLMA_SAMPLES)
-    dolma_samples = filter_language(dolma_samples, lang_model)
+    dolma_samples = filter_language(dolma_samples)
     dolma_samples = filter_samples(dolma_samples)
-    dolma_samples = filter_perplexity(dolma_samples, ppl_tokenizer, ppl_model, device)
+    dolma_samples = filter_quality(dolma_samples)
     dolma_samples = deduplicate_exact(dolma_samples)
     dolma_samples = deduplicate_substring(dolma_samples)
     dolma_samples = clean_samples(dolma_samples)
