@@ -25,6 +25,7 @@ num_heads  = 4
 hidden_dim = 128
 num_layers = 2
 block_size = 4
+max_steps  = 5000
 
 # ── Curated corpus (fineweb_corpus.txt / dolma_corpus.txt) ──
 # Use these when swapping to a larger curated corpus from data_curation/
@@ -34,6 +35,7 @@ block_size = 4
 # hidden_dim = 1024
 # num_layers = 8
 # block_size = 128
+# max_steps  = 50000
 
 # ── Cloud GPU (A100/H100) ──
 # embed_dim    = 512
@@ -43,13 +45,15 @@ block_size = 4
 # block_size   = 256
 # USE_COMPILE  = True    # torch.compile — significant speedup on CUDA
 # USE_AMP      = True    # automatic mixed precision — CUDA only, not MPS
+# max_steps  = 200000
 
-# ── CPU / Small GPU ──
+# ── CPU / Small GPU (Tesla V100)──
 # embed_dim  = 128
 # num_heads  = 4
 # hidden_dim = 512
 # num_layers = 4
 # block_size = 64
+# max_steps  = 20000
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────

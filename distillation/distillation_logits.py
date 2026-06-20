@@ -9,7 +9,6 @@ from torch.utils.data import Dataset, DataLoader
 
 # ─── Hardware Config ──────────────────────────────────────────────────────────
 
-# Device detection — automatically picks the best available
 device = (
     "mps"  if torch.backends.mps.is_available() else
     "cuda" if torch.cuda.is_available()         else
@@ -31,7 +30,9 @@ STUDENT_NUM_HEADS  = 4
 STUDENT_HIDDEN_DIM = 512
 STUDENT_NUM_LAYERS = 4
 
-block_size = 128
+block_size    = 128
+TEACHER_STEPS = 10000
+STUDENT_STEPS = 5000
 
 # ── Cloud GPU (A100/H100) ──
 # TEACHER_EMBED_DIM  = 512
@@ -43,10 +44,12 @@ block_size = 128
 # STUDENT_HIDDEN_DIM = 1024
 # STUDENT_NUM_LAYERS = 6
 # block_size         = 256
-# USE_COMPILE        = True    # torch.compile — significant speedup on CUDA
-# USE_AMP            = True    # automatic mixed precision — CUDA only, not MPS
+# TEACHER_STEPS      = 50000
+# STUDENT_STEPS      = 25000
+# USE_COMPILE        = True
+# USE_AMP            = True
 
-# ── CPU / Small GPU ──
+# ── CPU / Small GPU (Tesla V100) ──
 # TEACHER_EMBED_DIM  = 128
 # TEACHER_NUM_HEADS  = 4
 # TEACHER_HIDDEN_DIM = 512
@@ -56,13 +59,12 @@ block_size = 128
 # STUDENT_HIDDEN_DIM = 256
 # STUDENT_NUM_LAYERS = 2
 # block_size         = 64
+# TEACHER_STEPS      = 10000
+# STUDENT_STEPS      = 5000
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-# Two complementary reasoning corpora from Project Gutenberg
-# Sherlock Holmes — deductive reasoning (specific clues → single conclusion)
-# Darwin — inductive reasoning (many observations → general theory)
 CORPUS_URLS = {
     "sherlock": "https://www.gutenberg.org/files/1661/1661-0.txt",
     "darwin":   "https://www.gutenberg.org/files/1228/1228-0.txt"
@@ -75,38 +77,24 @@ COMBINED_CORPUS_PATH = "../data/reasoning_corpus.txt"
 TEACHER_SAVE         = "../data/distillation_teacher.pt"
 STUDENT_SAVE         = "../data/distillation_logits_student.pt"
 
-# Training hyperparameters
-TEACHER_STEPS    = 10000
-STUDENT_STEPS    = 5000
-BATCH_SIZE       = 16
-TEACHER_LR       = 3e-4
-STUDENT_LR       = 1e-4
+BATCH_SIZE  = 16
+TEACHER_LR  = 3e-4
+STUDENT_LR  = 1e-4
 
 # Distillation hyperparameters
-TEMPERATURE      = 4.0    # softens teacher distribution — higher = softer
-                          # soft labels carry more information than hard labels
-                          # temperature > 1 amplifies small probabilities
-                          # temperature = 1 is standard softmax — no softening
-ALPHA            = 0.5    # weight for hard label loss (cross entropy)
-BETA             = 0.5    # weight for soft label loss (KL divergence)
-                          # alpha + beta should sum to 1.0
-                          # higher alpha — student learns more from ground truth
-                          # higher beta  — student learns more from teacher
+TEMPERATURE = 4.0    # softens teacher distribution — higher = softer
+ALPHA       = 0.5    # weight for hard label loss (cross entropy)
+BETA        = 0.5    # weight for soft label loss (KL divergence)
 
 
 # ─── Tokenizer ────────────────────────────────────────────────────────────────
 
-# Both teacher and student MUST use the same tokenizer
-# logit distillation requires identical vocabulary sizes
-# the teacher output is a distribution over vocab_size tokens
-# the student must match that exact distribution — impossible with different vocabs
 tokenizer = tiktoken.encoding_for_model("gpt-4o")
 
 
 # ─── Corpus ───────────────────────────────────────────────────────────────────
 
 def strip_gutenberg(text):
-    # Strip Project Gutenberg header and footer
     start = text.find("*** START OF")
     end   = text.find("*** END OF")
     if start != -1 and end != -1:
@@ -115,8 +103,6 @@ def strip_gutenberg(text):
 
 
 def download_corpus():
-    # Download both corpora — only downloads if not already present
-    # reuses files downloaded by reasoning.py if they exist
     combined = []
 
     for name, url in CORPUS_URLS.items():
@@ -136,7 +122,6 @@ def download_corpus():
         combined.append(text)
         print(f"{name}: {len(text):,} characters")
 
-    # Check if combined corpus already exists
     if os.path.exists(COMBINED_CORPUS_PATH):
         print(f"\nCombined corpus already exists at {COMBINED_CORPUS_PATH}")
         with open(COMBINED_CORPUS_PATH, "r", encoding="utf8") as f:
@@ -248,9 +233,6 @@ class GPT(nn.Module):
 # ─── Train Teacher ────────────────────────────────────────────────────────────
 
 def train_teacher(model, data, device):
-    # Train the teacher model from scratch on the combined corpus
-    # teacher is larger and trains longer — it becomes the knowledge source
-    # once trained the teacher is frozen and never updated again
     print("\n" + "=" * 60)
     print("Stage 1 — Training Teacher")
     print("=" * 60)
@@ -290,53 +272,28 @@ def train_teacher(model, data, device):
 # ─── Logit Distillation Loss ──────────────────────────────────────────────────
 
 def distillation_loss(student_logits, teacher_logits, targets, temperature, alpha, beta):
-    # Logit distillation — the student learns from two signals simultaneously:
-    #
-    # 1. Hard label loss — standard cross entropy against ground truth tokens
-    #    this is the same loss used in normal language model training
-    #
-    # 2. Soft label loss — KL divergence between student and teacher distributions
-    #    the teacher's soft probabilities carry richer information than hard labels
-    #    example: for the token "dog", the teacher might assign:
-    #      "dog": 0.6, "cat": 0.2, "animal": 0.1, "pet": 0.05 ...
-    #    this tells the student that "cat" and "animal" are related — hard labels cannot
-    #
-    # temperature scaling softens both distributions before computing KL divergence
-    # higher temperature = flatter distribution = more information in the soft labels
-    # at inference time temperature is set back to 1.0
-
     B, T, C = student_logits.shape
 
-    # Hard label loss — standard next token prediction
     hard_loss = F.cross_entropy(
         student_logits.view(B * T, C),
         targets.view(B * T)
     )
 
-    # Soft label loss — KL divergence between temperature-scaled distributions
-    # temperature² scaling factor restores gradient magnitudes after softening
-    # this is from the original Hinton et al. 2015 distillation paper
     student_soft = F.log_softmax(student_logits / temperature, dim=-1)
     teacher_soft = F.softmax(teacher_logits   / temperature, dim=-1)
 
-    # KL divergence — measures how much student distribution diverges from teacher
-    # F.kl_div expects log probabilities for input and probabilities for target
     soft_loss = F.kl_div(
         student_soft.view(B * T, C),
         teacher_soft.view(B * T, C),
         reduction = "batchmean"
     ) * (temperature ** 2)
 
-    # Combined loss — weighted sum of hard and soft label losses
     return alpha * hard_loss + beta * soft_loss, hard_loss, soft_loss
 
 
 # ─── Train Student ────────────────────────────────────────────────────────────
 
 def train_student(student, teacher, data, device):
-    # Train the student model using logit distillation
-    # teacher is frozen — no gradients flow through it
-    # student learns from both ground truth tokens and teacher soft labels
     print("\n" + "=" * 60)
     print("Stage 2 — Logit Distillation")
     print("=" * 60)
@@ -350,7 +307,6 @@ def train_student(student, teacher, data, device):
     train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
     optimizer    = torch.optim.AdamW(student.parameters(), lr=STUDENT_LR)
 
-    # Freeze teacher — it is purely a knowledge source
     teacher.eval()
     for param in teacher.parameters():
         param.requires_grad = False
@@ -363,19 +319,14 @@ def train_student(student, teacher, data, device):
             if step >= STUDENT_STEPS:
                 break
 
-            x, y = x.to(device), y.to(device)
-
-            # Student forward pass — gradients flow
+            x, y           = x.to(device), y.to(device)
             student_logits = student(x)
 
-            # Teacher forward pass — no gradients needed
             with torch.no_grad():
                 teacher_logits = teacher(x)
 
-            # Combined distillation loss
             loss, hard_loss, soft_loss = distillation_loss(
-                student_logits, teacher_logits, y,
-                TEMPERATURE, ALPHA, BETA
+                student_logits, teacher_logits, y, TEMPERATURE, ALPHA, BETA
             )
 
             optimizer.zero_grad()
@@ -394,9 +345,6 @@ def train_student(student, teacher, data, device):
 # ─── Baseline Student (no distillation) ──────────────────────────────────────
 
 def train_baseline(model, data, device):
-    # Train a student-sized model from scratch without distillation
-    # used as a baseline to measure the benefit of distillation
-    # if distillation works the distilled student should outperform this baseline
     print("\n" + "=" * 60)
     print("Stage 3 — Baseline Student (no distillation)")
     print("=" * 60)
@@ -435,15 +383,13 @@ def train_baseline(model, data, device):
 # ─── Evaluation ───────────────────────────────────────────────────────────────
 
 def evaluate(model, data, device, label="Model"):
-    # Compute validation loss — lower is better
-    # used to compare teacher, distilled student, and baseline student
     model.eval()
-    dataset   = TextDataset(data, block_size)
-    split_idx = int(0.9 * len(dataset))
-    val_data  = torch.utils.data.Subset(dataset, range(split_idx, len(dataset)))
+    dataset    = TextDataset(data, block_size)
+    split_idx  = int(0.9 * len(dataset))
+    val_data   = torch.utils.data.Subset(dataset, range(split_idx, len(dataset)))
     val_loader = DataLoader(val_data, batch_size=BATCH_SIZE, shuffle=False)
 
-    total_loss = 0
+    total_loss    = 0
     total_batches = 0
 
     with torch.no_grad():
@@ -484,14 +430,12 @@ def generate(model, prompt, max_new_tokens=150, temperature=0.8):
 if __name__ == "__main__":
     torch.manual_seed(123)
 
-    # ── Download and prepare corpus ───────────────────────────────────────────
     text = download_corpus()
     data = torch.tensor(tokenizer.encode(text), dtype=torch.long)
 
     print(f"Vocab size:   {tokenizer.n_vocab:,}")
     print(f"Total tokens: {len(data):,}")
 
-    # ── Build teacher ─────────────────────────────────────────────────────────
     teacher = GPT(
         vocab_size  = tokenizer.n_vocab,
         block_size  = block_size,
@@ -504,7 +448,6 @@ if __name__ == "__main__":
     teacher_params = sum(p.numel() for p in teacher.parameters())
     print(f"\nTeacher parameters: {teacher_params:,}")
 
-    # ── Build distilled student ───────────────────────────────────────────────
     student = GPT(
         vocab_size  = tokenizer.n_vocab,
         block_size  = block_size,
@@ -518,7 +461,6 @@ if __name__ == "__main__":
     print(f"Student parameters: {student_params:,}")
     print(f"Compression ratio:  {teacher_params / student_params:.1f}x\n")
 
-    # ── Build baseline student (same size, no distillation) ───────────────────
     baseline = GPT(
         vocab_size  = tokenizer.n_vocab,
         block_size  = block_size,
@@ -528,16 +470,10 @@ if __name__ == "__main__":
         num_layers  = STUDENT_NUM_LAYERS
     ).to(device)
 
-    # ── Stage 1 — Train teacher ───────────────────────────────────────────────
     train_teacher(teacher, data, device)
-
-    # ── Stage 2 — Distil into student ─────────────────────────────────────────
     train_student(student, teacher, data, device)
-
-    # ── Stage 3 — Train baseline (no distillation) ───────────────────────────
     train_baseline(baseline, data, device)
 
-    # ── Comparison ────────────────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("Results")
     print("=" * 60)
@@ -548,7 +484,6 @@ if __name__ == "__main__":
     print(f"\n  Gap (distilled vs baseline): {baseline_loss - student_loss:.4f}")
     print(f"  Gap (teacher vs distilled):  {student_loss - teacher_loss:.4f}")
 
-    # ── Generation comparison ─────────────────────────────────────────────────
     print("\n" + "=" * 60)
     print("Generation Comparison")
     print("=" * 60)

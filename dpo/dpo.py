@@ -3,6 +3,7 @@ import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 import tiktoken
 from torch.utils.data import Dataset, DataLoader
 
@@ -21,36 +22,49 @@ print(f"Using device: {device}")
 # Sized to match the tiny corpus (~700 words, 20 SFT examples, 15 DPO examples)
 # A larger model would immediately overfit this data
 # Swap to the curated presets below when using fineweb/dolma corpora
-embed_dim  = 32
-num_heads  = 4
-hidden_dim = 128
-num_layers = 2
-block_size = 32
+embed_dim          = 32
+num_heads          = 4
+hidden_dim         = 128
+num_layers         = 2
+block_size         = 32
+pretrain_max_steps = 5000
+sft_max_steps      = 1000
+dpo_max_steps      = 500
 
 # ── Curated corpus (fineweb_corpus.txt + fineweb_sft.jsonl + fineweb_dpo.jsonl) ──
 # Use these when swapping to a larger curated corpus from data_curation/
-# ── Laptop / M4 Max ──
-# embed_dim  = 256
-# num_heads  = 8
-# hidden_dim = 1024
-# num_layers = 8
-# block_size = 128
+# max_steps must scale with corpus — 5000 pretrain steps barely touches a large corpus
+# ── Laptop / GPU < 40GB VRAM ──
+# embed_dim          = 256
+# num_heads          = 8
+# hidden_dim         = 1024
+# num_layers         = 8
+# block_size         = 128
+# pretrain_max_steps = 50000
+# sft_max_steps      = 5000
+# dpo_max_steps      = 1000
 
-# ── Cloud GPU (A100/H100) ──
-# embed_dim    = 512
-# num_heads    = 16
-# hidden_dim   = 2048
-# num_layers   = 12
-# block_size   = 256
-# USE_COMPILE  = True    # torch.compile — significant speedup on CUDA
-# USE_AMP      = True    # automatic mixed precision — CUDA only, not MPS
+# ── Cloud GPU ≥ 40GB VRAM (A100, H100) ──
+# embed_dim          = 512
+# num_heads          = 16
+# hidden_dim         = 2048
+# num_layers         = 12
+# block_size         = 256
+# pretrain_max_steps = 200000
+# sft_max_steps      = 20000
+# dpo_max_steps      = 5000
+# USE_COMPILE        = True    # torch.compile — significant speedup on CUDA
+# USE_AMP            = True    # automatic mixed precision — CUDA only, not MPS
 
-# ── CPU / Small GPU ──
-# embed_dim  = 128
-# num_heads  = 4
-# hidden_dim = 512
-# num_layers = 4
-# block_size = 64
+# ── CPU / Small GPU (Tesla V100) ──
+# embed_dim          = 128
+# num_heads          = 4
+# hidden_dim         = 512
+# num_layers         = 4
+# block_size         = 64
+# pretrain_max_steps = 20000
+# sft_max_steps      = 2000
+# dpo_max_steps      = 500
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -79,7 +93,6 @@ class PretrainDataset(Dataset):
         with open(path, "r", encoding="utf8") as f:
             text = f.read()
 
-        # Tokenize the entire corpus into a flat list of integer token IDs
         data            = tokenizer.encode(text)
         self.data       = torch.tensor(data, dtype=torch.long)
         self.block_size = block_size
@@ -104,8 +117,6 @@ class SFTDataset(Dataset):
             for line in f:
                 example = json.loads(line.strip())
 
-                # Format as instruction/response pair
-                # special tokens mark the boundary between instruction and response
                 text = (
                     f"### Instruction:\n{example['instruction']}\n\n"
                     f"### Response:\n{example['response']}"
@@ -113,7 +124,6 @@ class SFTDataset(Dataset):
 
                 tokens = tokenizer.encode(text)
 
-                # Pad or truncate to block_size
                 if len(tokens) < block_size:
                     tokens = tokens + [0] * (block_size - len(tokens))
                 else:
@@ -142,8 +152,6 @@ class DPODataset(Dataset):
             for line in f:
                 example = json.loads(line.strip())
 
-                # Format chosen and rejected responses as full prompt/response pairs
-                # DPO needs both to compute the preference loss
                 chosen_text = (
                     f"### Prompt:\n{example['prompt']}\n\n"
                     f"### Response:\n{example['chosen']}"
@@ -156,7 +164,6 @@ class DPODataset(Dataset):
                 chosen_tokens   = tokenizer.encode(chosen_text)
                 rejected_tokens = tokenizer.encode(rejected_text)
 
-                # Pad or truncate both to block_size
                 def pad(tokens):
                     if len(tokens) < block_size:
                         return tokens + [0] * (block_size - len(tokens))
@@ -265,14 +272,14 @@ def pretrain(model, device):
     split_idx  = int(0.9 * len(dataset))
     train_data = torch.utils.data.Subset(dataset, range(0, split_idx))
     loader     = DataLoader(train_data, batch_size=batch_size, shuffle=True)
-    optimizer  = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    optimizer  = optim.AdamW(model.parameters(), lr=3e-4)
 
     model.train()
     step = 0
 
-    while step < 5000:
+    while step < pretrain_max_steps:
         for x, y in loader:
-            if step >= 5000:
+            if step >= pretrain_max_steps:
                 break
 
             x, y    = x.to(device), y.to(device)
@@ -298,7 +305,6 @@ def sft_train(model, device):
     # Supervised fine tuning on instruction/response pairs
     # teaches the model to follow instructions using signals
     # already present from pretraining
-    # fine tuning a model with no pretraining signal produces poor results
     print("=" * 60)
     print("Stage 2 — SFT on sft dataset")
     print("=" * 60)
@@ -307,13 +313,12 @@ def sft_train(model, device):
     loader    = DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
     # Freeze embeddings — preserve token representations from pretraining
-    # only update the transformer blocks during fine tuning
     for param in model.token_embedding.parameters():
         param.requires_grad = False
     for param in model.position_embedding.parameters():
         param.requires_grad = False
 
-    optimizer = torch.optim.AdamW(
+    optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=1e-4   # lower than pretraining — nudging not rewriting
     )
@@ -323,9 +328,9 @@ def sft_train(model, device):
     model.train()
     step = 0
 
-    while step < 1000:
+    while step < sft_max_steps:
         for x, y in loader:
-            if step >= 1000:
+            if step >= sft_max_steps:
                 break
 
             x, y    = x.to(device), y.to(device)
@@ -359,19 +364,11 @@ def sft_train(model, device):
 # ─── Stage 3 — DPO ────────────────────────────────────────────────────────────
 
 def compute_log_probs(model, tokens):
-    # Compute the log probability of a sequence under the model
-    # used to measure how much the model prefers chosen vs rejected responses
     x      = tokens[:, :-1]
     y      = tokens[:, 1:]
     logits = model(x)
     log_probs = F.log_softmax(logits, dim=-1)
-
-    # Gather the log prob of each actual token
-    token_log_probs = log_probs.gather(
-        2, y.unsqueeze(-1)
-    ).squeeze(-1)
-
-    # Sum log probs across the sequence — overall sequence log probability
+    token_log_probs = log_probs.gather(2, y.unsqueeze(-1)).squeeze(-1)
     return token_log_probs.sum(dim=-1)
 
 
@@ -379,15 +376,6 @@ def dpo_loss(model, ref_model, chosen, rejected, beta=0.1):
     # DPO loss — Direct Preference Optimization
     # trains the model to prefer chosen responses over rejected ones
     # without needing a separate reward model (unlike RLHF)
-    #
-    # beta controls the strength of the KL penalty
-    # low beta  — model diverges more freely from the reference
-    # high beta — model stays closer to the reference (safer but less aligned)
-    #
-    # the reference model is a frozen copy of the SFT model
-    # it acts as a baseline — DPO pushes the policy model toward chosen
-    # while the KL term prevents it from drifting too far from the reference
-
     chosen_log_probs   = compute_log_probs(model, chosen)
     rejected_log_probs = compute_log_probs(model, rejected)
 
@@ -395,15 +383,10 @@ def dpo_loss(model, ref_model, chosen, rejected, beta=0.1):
         ref_chosen_log_probs   = compute_log_probs(ref_model, chosen)
         ref_rejected_log_probs = compute_log_probs(ref_model, rejected)
 
-    # Log ratio of policy to reference for chosen and rejected
-    # positive ratio means policy prefers this response more than reference did
     chosen_ratio   = chosen_log_probs   - ref_chosen_log_probs
     rejected_ratio = rejected_log_probs - ref_rejected_log_probs
 
-    # DPO loss — maximize the margin between chosen and rejected ratios
-    # sigmoid ensures the loss is bounded and stable
     loss = -F.logsigmoid(beta * (chosen_ratio - rejected_ratio)).mean()
-
     return loss
 
 
@@ -417,7 +400,7 @@ def dpo_train(model, ref_model, device):
 
     dataset   = DPODataset(DPO_DATA_PATH, tokenizer, block_size)
     loader    = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=5e-5)  # very low lr for alignment
+    optimizer = optim.AdamW(model.parameters(), lr=5e-5)  # very low lr for alignment
 
     print(f"DPO dataset size: {len(dataset)} examples")
 
@@ -425,9 +408,9 @@ def dpo_train(model, ref_model, device):
     ref_model.eval()  # reference model is always frozen
     step = 0
 
-    while step < 500:
+    while step < dpo_max_steps:
         for batch in loader:
-            if step >= 500:
+            if step >= dpo_max_steps:
                 break
 
             chosen   = batch["chosen"].to(device)
@@ -471,7 +454,6 @@ def generate(model, prompt, max_new_tokens=100):
 if __name__ == "__main__":
     torch.manual_seed(123)
 
-    # Build model
     model = MiniGPT(
         vocab_size  = tokenizer.n_vocab,
         block_size  = block_size,

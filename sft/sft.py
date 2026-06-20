@@ -2,6 +2,7 @@ import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.optim as optim
 import tiktoken
 from torch.utils.data import Dataset, DataLoader
 
@@ -20,49 +21,57 @@ print(f"Using device: {device}")
 # Sized to match the tiny corpus (~700 words, 20 SFT examples)
 # A larger model would immediately overfit this data
 # Swap to the curated presets below when using fineweb/dolma corpora
-embed_dim  = 32
-num_heads  = 4
-hidden_dim = 128
-num_layers = 2
-block_size = 32
+embed_dim          = 32
+num_heads          = 4
+hidden_dim         = 128
+num_layers         = 2
+block_size         = 32
+pretrain_max_steps = 5000
+sft_max_steps      = 1000
 
 # ── Curated corpus (fineweb_corpus.txt + fineweb_sft.jsonl) ──
 # Use these when swapping to a larger curated corpus from data_curation/
-# ── Laptop / M4 Max ──
-# embed_dim  = 256
-# num_heads  = 8
-# hidden_dim = 1024
-# num_layers = 8
-# block_size = 128
+# max_steps must scale with corpus — 5000 pretrain steps barely touches a large corpus
+# ── Laptop / GPU < 40GB VRAM ──
+# embed_dim          = 256
+# num_heads          = 8
+# hidden_dim         = 1024
+# num_layers         = 8
+# block_size         = 128
+# pretrain_max_steps = 50000
+# sft_max_steps      = 5000
 
-# ── Cloud GPU (A100/H100) ──
-# embed_dim    = 512
-# num_heads    = 16
-# hidden_dim   = 2048
-# num_layers   = 12
-# block_size   = 256
-# USE_COMPILE  = True    # torch.compile — significant speedup on CUDA
-# USE_AMP      = True    # automatic mixed precision — CUDA only, not MPS
+# ── Cloud GPU ≥ 40GB VRAM (A100, H100) ──
+# embed_dim          = 512
+# num_heads          = 16
+# hidden_dim         = 2048
+# num_layers         = 12
+# block_size         = 256
+# pretrain_max_steps = 200000
+# sft_max_steps      = 20000
+# USE_COMPILE        = True    # torch.compile — significant speedup on CUDA
+# USE_AMP            = True    # automatic mixed precision — CUDA only, not MPS
 
-# ── CPU / Small GPU ──
-# embed_dim  = 128
-# num_heads  = 4
-# hidden_dim = 512
-# num_layers = 4
-# block_size = 64
+# ── CPU / Small GPU (Tesla V100) ──
+# embed_dim          = 128
+# num_heads          = 4
+# hidden_dim         = 512
+# num_layers         = 4
+# block_size         = 64
+# pretrain_max_steps = 20000
+# sft_max_steps      = 2000
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 # Swap these paths when using curated corpora from data_curation/
-# e.g. CORPUS_PATH = "../data/fineweb_corpus.txt"
+# e.g. CORPUS_PATH   = "../data/fineweb_corpus.txt"
 #      SFT_DATA_PATH = "../data/fineweb_sft.jsonl"
 CORPUS_PATH   = "../data/tiny_corpus.txt"
 SFT_DATA_PATH = "../data/sft_dataset.jsonl"
 MODEL_SAVE    = "../data/sft_model.pt"
 
 batch_size    = 4      # small — SFT dataset is tiny
-max_steps     = 1000   # SFT needs fewer steps than pretraining
 learning_rate = 1e-4   # lower than pretraining — fine tuning not retraining
 
 
@@ -199,12 +208,12 @@ def pretrain(model, device):
         text = f.read()
 
     data      = torch.tensor(tokenizer.encode(text), dtype=torch.long)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    optimizer = optim.AdamW(model.parameters(), lr=3e-4)
 
     model.train()
     step = 0
 
-    while step < 5000:
+    while step < pretrain_max_steps:
         indices = torch.randint(0, len(data) - block_size, (batch_size,))
         x       = torch.stack([data[i:i + block_size] for i in indices]).to(device)
         y       = torch.stack([data[i + 1:i + block_size + 1] for i in indices]).to(device)
@@ -239,7 +248,7 @@ def sft_train(model, dataloader, device):
     for param in model.position_embedding.parameters():
         param.requires_grad = False
 
-    optimizer = torch.optim.AdamW(
+    optimizer = optim.AdamW(
         filter(lambda p: p.requires_grad, model.parameters()),
         lr=learning_rate
     )
@@ -247,9 +256,9 @@ def sft_train(model, dataloader, device):
     model.train()
     step = 0
 
-    while step < max_steps:
+    while step < sft_max_steps:
         for x, y in dataloader:
-            if step >= max_steps:
+            if step >= sft_max_steps:
                 break
 
             x = x.to(device)
@@ -300,7 +309,6 @@ def generate(model, prompt, max_new_tokens=100):
 if __name__ == "__main__":
     torch.manual_seed(123)
 
-    # Build model
     model = MiniGPT(
         vocab_size  = tokenizer.n_vocab,
         block_size  = block_size,

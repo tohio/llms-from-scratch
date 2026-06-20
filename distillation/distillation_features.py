@@ -28,7 +28,9 @@ STUDENT_NUM_HEADS  = 4
 STUDENT_HIDDEN_DIM = 512
 STUDENT_NUM_LAYERS = 4
 
-block_size = 128
+block_size    = 128
+TEACHER_STEPS = 10000
+STUDENT_STEPS = 5000
 
 # ── Cloud GPU (A100/H100) ──
 # TEACHER_EMBED_DIM  = 512
@@ -40,10 +42,12 @@ block_size = 128
 # STUDENT_HIDDEN_DIM = 1024
 # STUDENT_NUM_LAYERS = 6
 # block_size         = 256
+# TEACHER_STEPS      = 50000
+# STUDENT_STEPS      = 25000
 # USE_COMPILE        = True
 # USE_AMP            = True
 
-# ── CPU / Small GPU ──
+# ── CPU / Small GPU (Tesla V100) ──
 # TEACHER_EMBED_DIM  = 128
 # TEACHER_NUM_HEADS  = 4
 # TEACHER_HIDDEN_DIM = 512
@@ -53,6 +57,8 @@ block_size = 128
 # STUDENT_HIDDEN_DIM = 256
 # STUDENT_NUM_LAYERS = 2
 # block_size         = 64
+# TEACHER_STEPS      = 10000
+# STUDENT_STEPS      = 5000
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -69,24 +75,17 @@ COMBINED_CORPUS_PATH = "../data/reasoning_corpus.txt"
 TEACHER_SAVE         = "../data/distillation_teacher.pt"
 STUDENT_SAVE         = "../data/distillation_features_student.pt"
 
-TEACHER_STEPS = 10000
-STUDENT_STEPS = 5000
-BATCH_SIZE    = 16
-TEACHER_LR    = 3e-4
-STUDENT_LR    = 1e-4
+BATCH_SIZE  = 16
+TEACHER_LR  = 3e-4
+STUDENT_LR  = 1e-4
 
 # Feature distillation hyperparameters
 ALPHA = 0.5   # weight for hard label loss (cross entropy)
 BETA  = 0.5   # weight for feature matching loss (MSE on hidden states)
-              # alpha + beta should sum to 1.0
-              # higher alpha — student learns more from ground truth
-              # higher beta  — student learns more from teacher's internal representations
 
 
 # ─── Tokenizer ────────────────────────────────────────────────────────────────
 
-# Same requirement as logit distillation — both models need identical vocabulary
-# feature distillation also needs identical block_size so hidden states align positionally
 tokenizer = tiktoken.encoding_for_model("gpt-4o")
 
 
@@ -152,10 +151,8 @@ class TextDataset(Dataset):
 
 
 # ─── Model ────────────────────────────────────────────────────────────────────
-# Note: forward() returns both logits AND the final hidden state
+# forward() returns both logits AND the final hidden state
 # feature distillation needs access to intermediate representations
-# in a deeper implementation you would expose every layer's hidden state
-# here we expose the final hidden state before the lm_head as a clear example
 
 class MaskedMultiHeadAttention(nn.Module):
     def __init__(self, d_model, num_heads):
@@ -228,7 +225,7 @@ class GPT(nn.Module):
         position_embeddings = self.position_embedding(positions)
         x = token_embeddings + position_embeddings
         x = self.blocks(x)
-        hidden = self.final_norm(x)   # final hidden state — what feature distillation matches
+        hidden = self.final_norm(x)
         logits = self.lm_head(hidden)
 
         if return_hidden:
@@ -239,12 +236,9 @@ class GPT(nn.Module):
 # ─── Projection Layer ─────────────────────────────────────────────────────────
 
 class FeatureProjection(nn.Module):
-    # The teacher and student have different embed_dim — their hidden states
-    # live in different vector spaces and cannot be compared directly
-    # this projection layer maps student hidden states into the teacher's space
-    # this is the standard approach when student and teacher architectures differ
-    # (as opposed to feature distillation between same-sized architectures
-    # like DistilBERT, where dimensions already match)
+    # Teacher and student have different embed_dim — hidden states live in
+    # different vector spaces and cannot be compared directly.
+    # This projection maps student hidden states into the teacher's space.
     def __init__(self, student_dim, teacher_dim):
         super().__init__()
         self.proj = nn.Linear(student_dim, teacher_dim, bias=False)
@@ -295,36 +289,16 @@ def train_teacher(model, data, device):
 # ─── Feature Distillation Loss ────────────────────────────────────────────────
 
 def feature_distillation_loss(student_logits, student_hidden, teacher_hidden,
-                                projection, targets, alpha, beta):
-    # Feature distillation — the student learns from two signals:
-    #
-    # 1. Hard label loss — standard cross entropy against ground truth tokens
-    #    same as normal training, ensures the student still predicts correctly
-    #
-    # 2. Feature matching loss — MSE between student and teacher hidden states
-    #    this transfers HOW the teacher represents information internally,
-    #    not just WHAT it predicts
-    #    the student's internal representations are pushed to resemble
-    #    the teacher's richer, more capable representations
-    #
-    # student hidden states must be projected into the teacher's dimension
-    # before comparison since embed_dim differs between architectures
-    # this is more expensive than logit distillation but transfers
-    # deeper structural knowledge — used in TinyBERT, DistilBERT, PKD
-
+                               projection, targets, alpha, beta):
     B, T, C = student_logits.shape
 
-    # Hard label loss — standard next token prediction
     hard_loss = F.cross_entropy(
         student_logits.view(B * T, C),
         targets.view(B * T)
     )
 
-    # Project student hidden states into teacher's dimension
     projected_student_hidden = projection(student_hidden)
 
-    # Feature matching loss — mean squared error between representations
-    # detach teacher hidden states — no gradients flow back into the teacher
     feature_loss = F.mse_loss(
         projected_student_hidden,
         teacher_hidden.detach()
@@ -347,8 +321,6 @@ def train_student(student, teacher, projection, data, device):
     train_data   = torch.utils.data.Subset(dataset, range(0, split_idx))
     train_loader = DataLoader(train_data, batch_size=BATCH_SIZE, shuffle=True)
 
-    # Optimizer includes both student parameters and the projection layer
-    # the projection layer is learned jointly with the student
     optimizer = torch.optim.AdamW(
         list(student.parameters()) + list(projection.parameters()),
         lr=STUDENT_LR
@@ -369,10 +341,8 @@ def train_student(student, teacher, projection, data, device):
 
             x, y = x.to(device), y.to(device)
 
-            # Student forward pass — get logits AND hidden state
             student_logits, student_hidden = student(x, return_hidden=True)
 
-            # Teacher forward pass — get hidden state only, no gradients
             with torch.no_grad():
                 _, teacher_hidden = teacher(x, return_hidden=True)
 
@@ -513,8 +483,6 @@ if __name__ == "__main__":
     print(f"Student parameters: {student_params:,}")
     print(f"Compression ratio:  {teacher_params / student_params:.1f}x\n")
 
-    # Projection layer — maps student's embed_dim into teacher's embed_dim
-    # needed because feature distillation compares hidden states directly
     projection = FeatureProjection(STUDENT_EMBED_DIM, TEACHER_EMBED_DIM).to(device)
 
     baseline = GPT(

@@ -28,6 +28,7 @@ num_heads  = 8
 hidden_dim = 1024
 num_layers = 8
 block_size = 128
+max_steps  = 10000
 
 # ── Cloud GPU (A100/H100) ──
 # embed_dim    = 512
@@ -35,15 +36,17 @@ block_size = 128
 # hidden_dim   = 2048
 # num_layers   = 12
 # block_size   = 256
+# max_steps    = 50000
 # USE_COMPILE  = True    # torch.compile — significant speedup on CUDA
 # USE_AMP      = True    # automatic mixed precision — CUDA only, not MPS
 
-# ── CPU / Small GPU ──
+# ── CPU / Small GPU (Tesla V100) ──
 # embed_dim  = 128
 # num_heads  = 4
 # hidden_dim = 512
 # num_layers = 4
 # block_size = 64
+# max_steps  = 5000
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -65,7 +68,6 @@ COMBINED_CORPUS_PATH = "../data/reasoning_corpus.txt"
 MODEL_SAVE           = "../data/reasoning_model.pt"
 
 batch_size    = 16
-max_steps     = 10000
 learning_rate = 3e-4
 
 
