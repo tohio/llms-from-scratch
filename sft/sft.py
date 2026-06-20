@@ -64,12 +64,25 @@ sft_max_steps      = 1000
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-# Swap these paths when using curated corpora from data_curation/
-# e.g. CORPUS_PATH   = "../data/fineweb_corpus.txt"
-#      SFT_DATA_PATH = "../data/fineweb_sft.jsonl"
+# ── Default — tiny_corpus.txt ──
 CORPUS_PATH   = "../data/tiny_corpus.txt"
 SFT_DATA_PATH = "../data/sft_dataset.jsonl"
 MODEL_SAVE    = "../data/sft_model.pt"
+
+# ── FineWeb curated corpus ──
+# CORPUS_PATH   = "../data/fineweb_corpus.txt"
+# SFT_DATA_PATH = "../data/fineweb_sft.jsonl"
+# MODEL_SAVE    = "../data/fineweb_sft_model.pt"
+
+# ── Dolma curated corpus ──
+# CORPUS_PATH   = "../data/dolma_corpus.txt"
+# SFT_DATA_PATH = "../data/dolma_sft.jsonl"
+# MODEL_SAVE    = "../data/dolma_sft_model.pt"
+
+# ── Mixed curated corpus ──
+# CORPUS_PATH   = "../data/mixed_corpus.txt"
+# SFT_DATA_PATH = "../data/mixed_sft.jsonl"
+# MODEL_SAVE    = "../data/mixed_sft_model.pt"
 
 batch_size    = 4      # small — SFT dataset is tiny
 learning_rate = 1e-4   # lower than pretraining — fine tuning not retraining

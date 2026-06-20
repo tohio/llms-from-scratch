@@ -57,12 +57,21 @@ max_steps  = 5000
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-# Swap this path when using curated corpora from data_curation/
-CORPUS_PATH   = "../data/tiny_corpus.txt"
+# ── Default — tiny_corpus.txt ──
+CORPUS_PATH = "../data/tiny_corpus.txt"
+
+# ── FineWeb curated corpus ──
+# CORPUS_PATH = "../data/fineweb_corpus.txt"
+
+# ── Dolma curated corpus ──
+# CORPUS_PATH = "../data/dolma_corpus.txt"
+
+# ── Mixed curated corpus ──
+# CORPUS_PATH = "../data/mixed_corpus.txt"
 
 learning_rate = 3e-4
 batch_size    = 32
-max_steps     = 5000
+
 
 
 # ─── Tokenizer ────────────────────────────────────────────────────────────────

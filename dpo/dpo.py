@@ -69,14 +69,29 @@ dpo_max_steps      = 500
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-# Swap these paths when using curated corpora from data_curation/
-# e.g. CORPUS_PATH   = "../data/fineweb_corpus.txt"
-#      SFT_DATA_PATH = "../data/fineweb_sft.jsonl"
-#      DPO_DATA_PATH = "../data/fineweb_dpo.jsonl"
+# ── Default — tiny_corpus.txt ──
 CORPUS_PATH   = "../data/tiny_corpus.txt"
 SFT_DATA_PATH = "../data/sft_dataset.jsonl"
 DPO_DATA_PATH = "../data/dpo_dataset.jsonl"
 MODEL_SAVE    = "../data/dpo_model.pt"
+
+# ── FineWeb curated corpus ──
+# CORPUS_PATH   = "../data/fineweb_corpus.txt"
+# SFT_DATA_PATH = "../data/fineweb_sft.jsonl"
+# DPO_DATA_PATH = "../data/fineweb_dpo.jsonl"
+# MODEL_SAVE    = "../data/fineweb_dpo_model.pt"
+
+# ── Dolma curated corpus ──
+# CORPUS_PATH   = "../data/dolma_corpus.txt"
+# SFT_DATA_PATH = "../data/dolma_sft.jsonl"
+# DPO_DATA_PATH = "../data/dolma_dpo.jsonl"
+# MODEL_SAVE    = "../data/dolma_dpo_model.pt"
+
+# ── Mixed curated corpus ──
+# CORPUS_PATH   = "../data/mixed_corpus.txt"
+# SFT_DATA_PATH = "../data/mixed_sft.jsonl"
+# DPO_DATA_PATH = "../data/mixed_dpo.jsonl"
+# MODEL_SAVE    = "../data/mixed_dpo_model.pt"
 
 batch_size    = 4   # small — SFT and DPO datasets are tiny
 
