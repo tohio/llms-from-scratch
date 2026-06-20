@@ -35,15 +35,6 @@ MIXING_RATIOS = {
 
 def load_fineweb_sft(n_samples):
     print("Loading FineWeb SFT dataset (ultrachat_200k)...")
-    dataset = load_dataset(
-        "HuggingFaceFW/fineweb-edu",
-        name      = "sample-10BT",
-        split     = "train",
-        streaming = True
-    )
-
-    # ultrachat_200k is the SFT complement to FineWeb-Edu
-    # we use the train split and extract instruction/response pairs
     sft_dataset = load_dataset(
         "HuggingFaceH4/ultrachat_200k",
         split     = "train_sft",

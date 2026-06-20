@@ -21,8 +21,10 @@ MIN_RESPONSE_LEN = 50    # minimum response length in characters
 MAX_RESPONSE_LEN = 2000  # maximum response length in characters
 MIN_PROMPT_LEN   = 10    # minimum prompt length
 MIN_SCORE_GAP    = 0.5   # minimum score gap between chosen and rejected
-                          # ensures meaningful preference signal
-                          # low gap means chosen and rejected are too similar
+                          # applies only to datasets with numeric scores
+                          # (ultrafeedback_binarized — scored by GPT-4)
+                          # hh-rlhf uses binary human preference with no
+                          # numeric scores so this filter is skipped for it
 
 # Dataset mixing ratios — must sum to 1.0
 # should match pretrain_curate.py and sft_curate.py for domain consistency
@@ -58,7 +60,8 @@ def load_fineweb_dpo(n_samples):
         chosen_text   = chosen[-1].get("content", "").strip()   if chosen   else ""
         rejected_text = rejected[-1].get("content", "").strip() if rejected else ""
 
-        # extract scores if available — used for score gap filtering
+        # extract numeric scores — used for score gap filtering
+        # ultrafeedback_binarized is scored by GPT-4, scores are meaningful
         chosen_score   = example.get("score_chosen",   0)
         rejected_score = example.get("score_rejected", 0)
 
@@ -69,6 +72,7 @@ def load_fineweb_dpo(n_samples):
                 "rejected":        rejected_text,
                 "chosen_score":    chosen_score,
                 "rejected_score":  rejected_score,
+                "has_scores":      True,    # numeric scores available
                 "source":          "fineweb_dpo"
             })
 
@@ -80,6 +84,8 @@ def load_fineweb_dpo(n_samples):
 # Anthropic/hh-rlhf is topically aligned with Dolma
 # it contains human preference pairs on helpful and harmless responses
 # diverse domain coverage matches Dolma's web text diversity
+# note: hh-rlhf uses binary human preference — no numeric scores
+# the score gap filter is skipped for this source
 
 def load_dolma_dpo(n_samples):
     print("\nLoading Dolma DPO dataset (hh-rlhf)...")
@@ -94,8 +100,6 @@ def load_dolma_dpo(n_samples):
         if i >= n_samples:
             break
 
-        # hh-rlhf stores full conversations in chosen and rejected fields
-        # extract the last human turn as prompt and last assistant turn as response
         chosen_text   = example.get("chosen",   "").strip()
         rejected_text = example.get("rejected", "").strip()
 
@@ -105,10 +109,10 @@ def load_dolma_dpo(n_samples):
             parts = text.split("\n\nHuman:")
             if len(parts) < 2:
                 return "", ""
-            last_turn   = parts[-1]
-            human_part  = last_turn.split("\n\nAssistant:")
-            prompt      = human_part[0].strip()
-            response    = human_part[-1].strip() if len(human_part) > 1 else ""
+            last_turn  = parts[-1]
+            human_part = last_turn.split("\n\nAssistant:")
+            prompt     = human_part[0].strip()
+            response   = human_part[-1].strip() if len(human_part) > 1 else ""
             return prompt, response
 
         prompt,   chosen_response   = parse_conversation(chosen_text)
@@ -119,8 +123,9 @@ def load_dolma_dpo(n_samples):
                 "prompt":          prompt,
                 "chosen":          chosen_response,
                 "rejected":        rejected_response,
-                "chosen_score":    1.0,   # hh-rlhf has no numeric scores
-                "rejected_score":  0.0,   # binary preference only
+                "chosen_score":    None,   # hh-rlhf has no numeric scores
+                "rejected_score":  None,   # binary human preference only
+                "has_scores":      False,  # score gap filter skipped
                 "source":          "dolma_dpo"
             })
 
@@ -149,11 +154,13 @@ def filter_samples(samples):
         if len(rejected) < MIN_RESPONSE_LEN or len(rejected) > MAX_RESPONSE_LEN:
             continue
 
-        # score gap filter — ensure meaningful preference signal
-        # if chosen and rejected are scored too similarly the signal is weak
-        score_gap = example["chosen_score"] - example["rejected_score"]
-        if score_gap < MIN_SCORE_GAP:
-            continue
+        # score gap filter — only applied when numeric scores are available
+        # hh-rlhf uses binary human preference with no numeric scores
+        # so the filter is skipped for that source to avoid a no-op comparison
+        if example["has_scores"]:
+            score_gap = example["chosen_score"] - example["rejected_score"]
+            if score_gap < MIN_SCORE_GAP:
+                continue
 
         # chosen and rejected should not be identical
         if chosen == rejected:
